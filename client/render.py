@@ -158,9 +158,11 @@ def format_rows(rows):
 
 
 def unit_line(units):
+    """Your units, with what each has left to spend this turn."""
     return "  " + "   ".join(
         f"{paint(str(u['unit_id']), u['colour'], bold=True)}:{u['type']}"
-        f"({u['x']},{u['y']}) {u['moves_left']}mp" for u in units) if units else ""
+        f"({u['x']},{u['y']}) {u['hp']}hp {u['moves_left']}mp {u['actions_left']}ap"
+        for u in units) if units else ""
 
 
 def emit(lines):

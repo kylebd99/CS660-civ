@@ -32,7 +32,7 @@ SELECT c.city_id,
        c.civ_id,
        4 + COALESCE(SUM(w.food),       0) AS food,        -- 4 from the centre
        1 + COALESCE(SUM(w.production), 0) AS production,  -- 1 from the centre
-           COALESCE(SUM(w.gold),       0) AS gold
+       2 + COALESCE(SUM(w.gold),       0) AS gold         -- 2 from the centre
 FROM      city        c
 LEFT JOIN city_worked w ON w.city_id = c.city_id
 GROUP BY c.city_id, c.civ_id;
@@ -58,6 +58,22 @@ WHERE NOT EXISTS (                                  -- ...not already known
           AND NOT EXISTS (
                 SELECT 1 FROM civ_tech k2
                 WHERE k2.civ_id = c.civ_id AND k2.tech = p.requires));
+
+-- ------------------------------------------------------------- the shop
+-- What is for sale, per civ, and whether that civ has unlocked it yet.
+--
+-- Shaped like available_tech: a civ_id column rather than current_civ(), so a
+-- psql session can read any civ's shop without first saying who it is playing.
+-- Locked rows are listed rather than hidden -- knowing a knight needs Bronze
+-- Working is what makes the tech tree worth climbing.
+CREATE VIEW unit_shop AS
+SELECT c.civ_id, ut.code, ut.cost, ut.max_hp, ut.moves, ut.actions,
+       ut.strength, ut.founds_cities, ut.required_tech,
+       ut.required_tech IS NULL
+         OR EXISTS (SELECT 1 FROM civ_tech k
+                    WHERE k.civ_id = c.civ_id AND k.tech = ut.required_tech)
+         AS unlocked
+FROM civ c CROSS JOIN unit_type ut;
 
 -- ------------------------------------------------------------- the map
 -- Flattened map rows, so the client never joins anything.

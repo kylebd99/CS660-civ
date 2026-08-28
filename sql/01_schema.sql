@@ -24,14 +24,6 @@ CREATE TABLE terrain (
   passable   boolean NOT NULL DEFAULT true
 );
 
-CREATE TABLE unit_type (
-  code   text PRIMARY KEY,
-  glyph  text NOT NULL,
-  max_hp int  NOT NULL,
-  moves  int  NOT NULL CHECK (moves > 0),
-  founds_cities boolean NOT NULL DEFAULT false
-);
-
 CREATE TABLE tech (
   code text PRIMARY KEY,
   name text NOT NULL,
@@ -46,6 +38,24 @@ CREATE TABLE tech_prereq (
   requires text NOT NULL REFERENCES tech,
   PRIMARY KEY (tech, requires),
   CHECK (tech <> requires)
+);
+
+CREATE TABLE unit_type (
+  code   text PRIMARY KEY,
+  glyph  text NOT NULL,
+  max_hp int  NOT NULL,
+  -- Two separate budgets. Movement points are spent walking, and terrain
+  -- decides how many a step costs. Action points are spent *doing* something
+  -- -- attacking, founding a city -- and every such thing costs one, so a
+  -- unit acts once a turn however far it walked.
+  moves    int NOT NULL CHECK (moves > 0),
+  actions  int NOT NULL DEFAULT 1 CHECK (actions >= 0),
+  strength int NOT NULL DEFAULT 0 CHECK (strength >= 0),   -- 0 cannot attack
+  cost     int NOT NULL DEFAULT 0 CHECK (cost >= 0),       -- gold to buy one
+  founds_cities boolean NOT NULL DEFAULT false,
+  -- NULL means anyone can buy it. Otherwise the civ must know this tech
+  -- first, which is what gives the tech tree something to unlock.
+  required_tech text REFERENCES tech
 );
 
 -- --------------------------------------------------------------------- state
@@ -104,11 +114,11 @@ CREATE TABLE unit (
   type       text   NOT NULL REFERENCES unit_type,
   tile_id    bigint NOT NULL REFERENCES tile,
   hp         int    NOT NULL CHECK (hp > 0),
-  moves_left int    NOT NULL CHECK (moves_left >= 0)
+  moves_left int    NOT NULL CHECK (moves_left >= 0),
+  actions_left int  NOT NULL CHECK (actions_left >= 0)
 );
 
--- At most one unit per tile. Under concurrent turns this is the constraint that
--- turns a silent corruption into a loud, recoverable error.
+-- At most one unit can live on a tile.
 CREATE UNIQUE INDEX unit_one_per_tile ON unit (tile_id);
 
 CREATE TABLE civ_tech (
@@ -126,17 +136,6 @@ BEGIN
   -- Land in the game schema: `city_yield`, not `game.city_yield`.
   EXECUTE format('ALTER DATABASE %I SET search_path TO game, public',
                  current_database());
-
-  -- SERIALIZABLE by default. Postgres ships READ COMMITTED, under which each
-  -- statement -- including each statement inside a function -- takes a fresh
-  -- snapshot, so a turn can straddle another player's commit. SERIALIZABLE
-  -- gives every transaction one snapshot and aborts anything that could not
-  -- have happened in some serial order.
-  --
-  -- The cost is that transactions can now fail with serialization_failure
-  -- (SQLSTATE 40001) and are expected to be retried. Nothing here retries yet;
-  -- with one player there is nothing to conflict with, and when concurrency
-  -- arrives those failures are the lesson.
   EXECUTE format('ALTER DATABASE %I SET default_transaction_isolation = %L',
                  current_database(), 'serializable');
 END $$;

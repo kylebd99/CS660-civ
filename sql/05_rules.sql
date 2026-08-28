@@ -63,8 +63,9 @@ BEGIN
                       (_height / 2)::int)
     LIMIT 1;
 
-    INSERT INTO unit (civ_id, type, tile_id, hp, moves_left)
-    SELECT cid, 'settler', home, ut.max_hp, ut.moves FROM unit_type ut WHERE ut.code = 'settler';
+    INSERT INTO unit (civ_id, type, tile_id, hp, moves_left, actions_left)
+    SELECT cid, 'settler', home, ut.max_hp, ut.moves, ut.actions
+    FROM unit_type ut WHERE ut.code = 'settler';
 
     -- An escort on any free neighbouring land tile.
     SELECT t.tile_id INTO guard
@@ -75,8 +76,9 @@ BEGIN
     LIMIT 1;
 
     IF guard IS NOT NULL THEN
-      INSERT INTO unit (civ_id, type, tile_id, hp, moves_left)
-      SELECT cid, 'warrior', guard, ut.max_hp, ut.moves FROM unit_type ut WHERE ut.code = 'warrior';
+      INSERT INTO unit (civ_id, type, tile_id, hp, moves_left, actions_left)
+      SELECT cid, 'warrior', guard, ut.max_hp, ut.moves, ut.actions
+      FROM unit_type ut WHERE ut.code = 'warrior';
     END IF;
   END LOOP;
 END $$;
@@ -103,6 +105,14 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'unit % cannot found cities', _unit;
   END IF;
+
+  -- Founding is an action like any other. The settler is consumed a few lines
+  -- below, so what this really enforces is that a unit which has already acted
+  -- this turn cannot also found.
+  IF NOT EXISTS (SELECT 1 FROM unit WHERE unit_id = _unit AND actions_left >= 1) THEN
+    RAISE EXCEPTION 'unit % has no action left this turn', _unit;
+  END IF;
+  UPDATE unit SET actions_left = actions_left - 1 WHERE unit_id = _unit;
 
   INSERT INTO city (civ_id, tile_id, name) VALUES (u.civ_id, u.tile_id, _name)
   RETURNING city_id INTO new_city;
@@ -160,6 +170,146 @@ BEGIN
   UPDATE civ SET researching = _tech WHERE civ_id = current_civ();
 END $$;
 
+-- --------------------------------------------------------------- buy_unit
+-- Pay gold for a unit and put it down within one tile of one of your cities.
+--
+-- "Within one tile" includes the city square itself, so a city with no room
+-- around it can still garrison. The new unit arrives having already spent its
+-- turn: no movement, no action. That is what stops you buying a warrior and
+-- attacking with it in the same breath, and it is one line to change if you
+-- would rather they arrive ready.
+CREATE FUNCTION buy_unit(_type text, _x int, _y int)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  kind    record;
+  purse   int;
+  dest    bigint;
+  bought  int;
+BEGIN
+  SELECT * INTO kind FROM unit_type WHERE code = _type;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'there is no unit called %', _type
+      USING HINT = 'SELECT * FROM unit_shop';
+  END IF;
+
+  IF kind.required_tech IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM civ_tech
+                     WHERE civ_id = current_civ() AND tech = kind.required_tech) THEN
+    RAISE EXCEPTION 'a % needs %', _type, kind.required_tech
+      USING HINT = 'SELECT * FROM unit_shop WHERE civ_id = current_civ()';
+  END IF;
+
+  SELECT gold INTO purse FROM civ WHERE civ_id = current_civ();
+  IF purse < kind.cost THEN
+    RAISE EXCEPTION 'a % costs %g and you have %g', _type, kind.cost, purse;
+  END IF;
+
+  -- The tile has to exist, be walkable, be empty, and be next to a city of
+  -- yours. Checked as one query so the error can say which part failed.
+  SELECT t.tile_id INTO dest
+  FROM tile t
+  JOIN terrain te ON te.code = t.terrain
+  WHERE t.x = _x AND t.y = _y AND te.passable;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION '(%, %) is not somewhere a unit can stand', _x, _y;
+  END IF;
+  IF EXISTS (SELECT 1 FROM unit WHERE tile_id = dest) THEN
+    RAISE EXCEPTION '(%, %) is already occupied', _x, _y;
+  END IF;
+  IF NOT EXISTS (
+       SELECT 1 FROM city c
+       JOIN tile ct ON ct.tile_id = c.tile_id
+       WHERE c.civ_id = current_civ() AND distance(ct.x, ct.y, _x, _y) <= 1) THEN
+    RAISE EXCEPTION '(%, %) is not next to a city of yours', _x, _y;
+  END IF;
+
+  UPDATE civ SET gold = gold - kind.cost WHERE civ_id = current_civ();
+
+  INSERT INTO unit (civ_id, type, tile_id, hp, moves_left, actions_left)
+  VALUES (current_civ(), _type, dest, kind.max_hp, 0, 0)
+  RETURNING unit_id INTO bought;
+
+  RETURN format('bought %s %s at (%s, %s) for %sg; %sg left, ready next turn',
+                _type, bought, _x, _y, kind.cost, purse - kind.cost);
+END $$;
+
+-- ----------------------------------------------------------------- attack
+-- Strike the unit standing on (_x, _y) from an adjacent tile.
+--
+-- Combat is deliberately deterministic: the same fight always plays out the
+-- same way, which makes it something you can reason about in a lecture rather
+-- than something you have to re-run. The defender takes the attacker's full
+-- strength; the attacker takes half the defender's in return, so attacking is
+-- worthwhile but not free. Nobody advances into the tile -- one unit per tile
+-- is a unique index, and letting the winner move would mean deciding what
+-- happens when it has no movement left.
+CREATE FUNCTION attack(_unit int, _x int, _y int)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  me      record;
+  foe     record;
+  dealt   int;
+  taken   int;
+BEGIN
+  SELECT u.unit_id, u.type, u.hp, u.actions_left, t.x, t.y, ut.strength
+  INTO me
+  FROM unit u
+  JOIN tile      t  ON t.tile_id = u.tile_id
+  JOIN unit_type ut ON ut.code   = u.type
+  WHERE u.unit_id = _unit AND u.civ_id = current_civ();
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'unit % is not yours', _unit;
+  END IF;
+  IF me.strength = 0 THEN
+    RAISE EXCEPTION 'a % cannot attack', me.type;
+  END IF;
+  IF me.actions_left < 1 THEN
+    RAISE EXCEPTION 'unit % has no action left this turn', _unit;
+  END IF;
+  IF distance(me.x, me.y, _x, _y) <> 1 THEN
+    RAISE EXCEPTION 'unit % is not next to (%, %)', _unit, _x, _y;
+  END IF;
+
+  SELECT u.unit_id, u.type, u.hp, u.civ_id, ut.strength
+  INTO foe
+  FROM unit u
+  JOIN tile      t  ON t.tile_id = u.tile_id
+  JOIN unit_type ut ON ut.code   = u.type
+  WHERE t.x = _x AND t.y = _y;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'nothing to attack at (%, %)', _x, _y;
+  END IF;
+  IF foe.civ_id = current_civ() THEN
+    RAISE EXCEPTION 'unit % is your own', foe.unit_id;
+  END IF;
+
+  dealt := me.strength;
+  taken := foe.strength / 2;
+
+  UPDATE unit SET actions_left = actions_left - 1 WHERE unit_id = _unit;
+
+  -- hp is CHECK (hp > 0), so a casualty is removed rather than written to zero.
+  IF foe.hp <= dealt THEN
+    DELETE FROM unit WHERE unit_id = foe.unit_id;
+  ELSE
+    UPDATE unit SET hp = hp - dealt WHERE unit_id = foe.unit_id;
+  END IF;
+
+  IF me.hp <= taken THEN
+    DELETE FROM unit WHERE unit_id = _unit;
+  ELSIF taken > 0 THEN
+    UPDATE unit SET hp = hp - taken WHERE unit_id = _unit;
+  END IF;
+
+  RETURN format('%s %s hits %s %s for %s, takes %s%s%s',
+                me.type, _unit, foe.type, foe.unit_id, dealt, taken,
+                CASE WHEN foe.hp <= dealt THEN '; defender destroyed' ELSE '' END,
+                CASE WHEN me.hp <= taken  THEN '; attacker destroyed' ELSE '' END);
+END $$;
+
 -- --------------------------------------------------------------- end_turn
 -- The entire world advances in six statements. None of them mentions a
 -- particular city, unit or civ: each one operates on every row at once.
@@ -195,9 +345,11 @@ BEGIN
   UPDATE civ c SET science = c.science - t.cost, researching = NULL
   FROM tech t WHERE t.code = c.researching AND c.science >= t.cost;
 
-  -- 5. Every unit gets its movement back.
-  UPDATE unit u SET moves_left = ut.moves
-  FROM unit_type ut WHERE ut.code = u.type AND u.moves_left <> ut.moves;
+  -- 5. Every unit gets its movement and its action back.
+  UPDATE unit u SET moves_left = ut.moves, actions_left = ut.actions
+  FROM unit_type ut
+  WHERE ut.code = u.type
+    AND (u.moves_left <> ut.moves OR u.actions_left <> ut.actions);
 
   -- 6. The clock advances.
   UPDATE world SET turn = turn + 1 WHERE id = 1 RETURNING turn INTO next_turn;

@@ -11,11 +11,6 @@ INSERT INTO terrain (code, glyph, colour, food, production, gold, move_cost, pas
   ('hills',    'n', 137, 0, 3, 0, 2, true ),
   ('mountain', '^', 245, 0, 0, 0, 1, false);
 
-INSERT INTO unit_type (code, glyph, max_hp, moves, founds_cities) VALUES
-  ('settler', 's', 10, 2, true ),
-  ('warrior', 'w', 20, 2, false),
-  ('scout',   'o', 10, 4, false);
-
 INSERT INTO tech (code, name, cost) VALUES
   ('agriculture',      'Agriculture',      20),
   ('mining',           'Mining',           20),
@@ -41,3 +36,10 @@ INSERT INTO tech_prereq (tech, requires) VALUES
   ('mathematics',      'currency'),
   ('mathematics',      'the_wheel'),
   ('philosophy',       'writing');
+
+INSERT INTO unit_type (code, glyph, max_hp, moves, actions, strength, cost,
+                       founds_cities, required_tech) VALUES
+  ('settler', 's', 10, 2, 1,  0, 40, true,  NULL),   -- strength 0: cannot attack
+  ('warrior', 'w', 20, 2, 1,  6, 25, false, NULL),
+  ('scout',   'o', 10, 4, 1,  2, 15, false, NULL),
+  ('knight',  'k', 30, 3, 1, 10, 60, false, 'bronze_working');

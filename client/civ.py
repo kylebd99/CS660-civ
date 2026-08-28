@@ -44,7 +44,8 @@ VIEW_HOME = """SELECT x, y FROM (
                    JOIN tile t ON t.tile_id = u.tile_id WHERE u.civ_id = %s
                ) home ORDER BY rank LIMIT 1"""
 
-UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left, t.x, t.y, c.colour
+UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left,
+                  u.actions_left, u.hp, t.x, t.y, c.colour
            FROM unit u
            JOIN unit_type ut ON ut.code    = u.type
            JOIN tile      t  ON t.tile_id  = u.tile_id
@@ -64,6 +65,9 @@ AVAILABLE_TECH = """SELECT code, name, cost FROM available_tech
 
 REACHABLE = "SELECT x, y, cost FROM reachable(%s)"
 
+UNIT_SHOP = """SELECT code, cost, moves, strength, required_tech, unlocked
+               FROM unit_shop WHERE civ_id = %s ORDER BY cost"""
+
 MY_UNIT_AT = """SELECT u.unit_id FROM unit u
                 JOIN tile t ON t.tile_id = u.tile_id
                 WHERE t.x = %s AND t.y = %s AND u.civ_id = %s"""
@@ -72,6 +76,8 @@ MY_UNIT_AT = """SELECT u.unit_id FROM unit u
 
 NEW_GAME = "SELECT new_game(%s, %s, %s, %s)"
 MOVE_UNIT = "SELECT move_unit(%s, %s, %s) AS cost"
+ATTACK = "SELECT attack(%s, %s, %s) AS outcome"
+BUY_UNIT = "SELECT buy_unit(%s, %s, %s) AS outcome"
 FOUND_CITY = "SELECT found_city(%s, %s) AS city_id"
 SET_RESEARCH = "SELECT set_research(%s)"
 
@@ -132,6 +138,30 @@ def cmd_new(db, state, args):
 def cmd_move(db, state, args):
     unit, x, y = int(args[0]), int(args[1]), int(args[2])
     db.call(MOVE_UNIT, (unit, x, y))
+
+
+def cmd_buy(db, state, args):
+    """`b` alone prices the catalogue; `b <type> <x> <y>` buys one and puts it
+    down. Two forms of one command, like `t`."""
+    if not args:
+        # Locked units are shown too, greyed out with what they need, so the
+        # shop doubles as a reason to research something.
+        state["note"] = "  " + "   ".join(
+            f"{u['code']} {u['cost']}g ({u['moves']}mp str{u['strength']})"
+            if u["unlocked"] else
+            render.paint(f"{u['code']} needs {u['required_tech']}", 244)
+            for u in db.rows(UNIT_SHOP, (active_civ(db, state),)))
+        return
+    kind, x, y = args[0], int(args[1]), int(args[2])
+    state["note"] = f"  {db.call(BUY_UNIT, (kind, x, y))['outcome']}"
+
+
+def cmd_attack(db, state, args):
+    """Strike an adjacent enemy. The outcome comes back as a sentence, because
+    the interesting part is what happened, not a number."""
+    unit, x, y = int(args[0]), int(args[1]), int(args[2])
+    hit = db.call(ATTACK, (unit, x, y))
+    state["note"] = f"  {hit['outcome']}"
 
 
 def cmd_found(db, state, args):
@@ -204,6 +234,8 @@ def cmd_quit(db, state, args):
 COMMANDS = {
     "n": (cmd_new,      "n [w] [h] [civs] [seed]   start a new game"),
     "m": (cmd_move,     "m <unit> <x> <y>    move a unit"),
+    "a": (cmd_attack,   "a <unit> <x> <y>    attack an adjacent enemy"),
+    "b": (cmd_buy,      "b [type x y]        list unit prices, or buy one"),
     "c": (cmd_found,    "c <unit> <name>     found a city with a settler"),
     "t": (cmd_research, "t [tech]            list or choose research"),
     "s": (cmd_reach,    "s <unit>            highlight where a unit can go"),
