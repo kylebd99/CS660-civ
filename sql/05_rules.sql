@@ -4,6 +4,24 @@
 
 SET search_path TO game, public;
 
+-- --------------------------------------------------------------- identity
+-- Which civ the current connection is playing. Set it with
+--   SELECT set_config('app.civ_id', '2', false);
+--
+-- The rules below consult this rather than taking the civ as an argument, so a
+-- client cannot act for someone else just by naming them. It is a session
+-- setting, not an argument, for the same reason a web app reads the session
+-- cookie instead of a "user_id" form field.
+CREATE FUNCTION current_civ() RETURNS int LANGUAGE plpgsql STABLE AS $$
+DECLARE raw text := current_setting('app.civ_id', true);
+BEGIN
+  IF raw IS NULL OR raw = '' THEN
+    RAISE EXCEPTION 'no civ selected for this session'
+      USING HINT = 'SELECT set_config(''app.civ_id'', ''1'', false)';
+  END IF;
+  RETURN raw::int;
+END $$;
+
 -- --------------------------------------------------------------- new_game
 -- Wipe the world and deal a fresh one. Terrain is a pure function of the seed,
 -- so the same seed always produces the same map.
@@ -68,6 +86,13 @@ CREATE FUNCTION found_city(_unit int, _name text)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE u record; new_city int;
 BEGIN
+  -- Ownership first, so acting on someone else's unit says so plainly rather
+  -- than failing later for some incidental reason.
+  IF NOT EXISTS (SELECT 1 FROM unit
+                 WHERE unit_id = _unit AND civ_id = current_civ()) THEN
+    RAISE EXCEPTION 'unit % is not yours', _unit;
+  END IF;
+
   SELECT un.unit_id, un.civ_id, un.tile_id, t.q, t.r INTO u
   FROM unit un
   JOIN tile      t  ON t.tile_id = un.tile_id
@@ -75,7 +100,7 @@ BEGIN
   WHERE un.unit_id = _unit AND ut.founds_cities;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'unit % does not exist or cannot found cities', _unit;
+    RAISE EXCEPTION 'unit % cannot found cities', _unit;
   END IF;
 
   INSERT INTO city (civ_id, tile_id, name) VALUES (u.civ_id, u.tile_id, _name)
@@ -102,6 +127,11 @@ CREATE FUNCTION move_unit(_unit int, _q int, _r int)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE dest bigint; spent int;
 BEGIN
+  IF NOT EXISTS (SELECT 1 FROM unit
+                 WHERE unit_id = _unit AND civ_id = current_civ()) THEN
+    RAISE EXCEPTION 'unit % is not yours', _unit;
+  END IF;
+
   SELECT rc.tile_id, rc.cost INTO dest, spent
   FROM reachable(_unit) rc WHERE rc.q = _q AND rc.r = _r;
 
@@ -112,6 +142,21 @@ BEGIN
   -- If another unit is standing there, unit_one_per_tile rejects this update.
   UPDATE unit SET tile_id = dest, moves_left = moves_left - spent WHERE unit_id = _unit;
   RETURN spent;
+END $$;
+
+-- ------------------------------------------------------------- set_research
+-- Choose what to research next. The client used to UPDATE civ directly, which
+-- meant nothing stopped you picking a tech whose prerequisites you had not met;
+-- available_tech already defines what is legal, so ask it.
+CREATE FUNCTION set_research(_tech text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM available_tech
+                 WHERE civ_id = current_civ() AND code = _tech) THEN
+    RAISE EXCEPTION '% is not available to you', _tech
+      USING HINT = 'you already know it, or a prerequisite is missing';
+  END IF;
+
+  UPDATE civ SET researching = _tech WHERE civ_id = current_civ();
 END $$;
 
 -- --------------------------------------------------------------- end_turn

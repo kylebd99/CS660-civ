@@ -60,20 +60,29 @@ WHERE NOT EXISTS (                                  -- ...not already known
                 WHERE k2.civ_id = c.civ_id AND k2.tech = p.requires));
 
 -- ------------------------------------------------------------- the map
--- Flattened map rows for the renderer, so the client never joins anything.
+-- Flattened map rows, so the client never joins anything.
 CREATE VIEW map AS
 SELECT ti.tile_id, ti.q, ti.r, ti.terrain,
        te.glyph, te.colour, te.passable, te.move_cost
 FROM tile ti JOIN terrain te ON te.code = ti.terrain;
 
+-- The slice of the map a terminal can actually show.
+--
+-- The rectangle is given in *screen* cells rather than hex coordinates,
+-- because that is what a viewport is: a hex at (q, r) is drawn at column
+-- 2q + r and row r. 
+CREATE FUNCTION map_window(_col_min int, _col_max int, _row_min int, _row_max int)
+RETURNS TABLE (q int, r int, glyph text, colour int)
+LANGUAGE sql STABLE AS $$
+  SELECT t.q, t.r, te.glyph, te.colour
+  FROM tile t JOIN terrain te ON te.code = t.terrain
+  WHERE t.r BETWEEN _row_min AND _row_max
+    AND 2 * t.q + t.r BETWEEN _col_min AND _col_max;
+$$;
+
 -- ------------------------------------------------------------- movement
 -- Where a unit could walk with the movement it has left, as a recursive walk
 -- over hex adjacency accumulating terrain move costs.
---
--- This is deliberately the naive formulation: it re-expands hexes reached by
--- more than one path and only takes the minimum at the end. With 2-4 movement
--- points that is fine, and it gives you a query whose plan is worth looking at
--- once you get to query optimisation.
 CREATE FUNCTION reachable(_unit int)
 RETURNS TABLE (tile_id bigint, q int, r int, cost int)
 LANGUAGE sql STABLE AS $$

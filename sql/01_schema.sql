@@ -73,15 +73,21 @@ CREATE TABLE tile (
   r       int  NOT NULL,
   terrain text NOT NULL REFERENCES terrain,
   -- This is the index the performance demo drops and rebuilds. Every lookup
-  -- the renderer and the movement rules do goes through (q, r).
+  -- the movement rules do goes through (q, r).
   UNIQUE (q, r)
 );
+
+-- The renderer does not ask for hexes by coordinate, it asks for a rectangle of
+-- the screen: a hex at (q, r) is drawn at column 2q + r, row r. So the query it
+-- runs is a range over r and over the expression 2q + r, and neither is served
+-- well by the (q, r) index above. An expression index makes it a range scan.
+CREATE INDEX tile_screen ON tile (r, (2 * q + r));
 
 CREATE TABLE city (
   city_id    serial PRIMARY KEY,
   civ_id     int    NOT NULL REFERENCES civ,
   tile_id    bigint NOT NULL UNIQUE REFERENCES tile,   -- one city per tile
-  name       text   NOT NULL,
+  name       text   NOT NULL UNIQUE,
   population int    NOT NULL DEFAULT 1 CHECK (population > 0),
   food_store int    NOT NULL DEFAULT 0 CHECK (food_store >= 0)
 );
@@ -115,3 +121,26 @@ CREATE TABLE civ_tech (
   learned_turn int  NOT NULL,
   PRIMARY KEY (civ_id, tech)
 );
+
+-- Database-level defaults, so psql, the client and any GUI all get them
+-- without having to remember. Written dynamically because the database is
+-- named by whoever created it.
+DO $$
+BEGIN
+  -- Land in the game schema: `city_yield`, not `game.city_yield`.
+  EXECUTE format('ALTER DATABASE %I SET search_path TO game, public',
+                 current_database());
+
+  -- SERIALIZABLE by default. Postgres ships READ COMMITTED, under which each
+  -- statement -- including each statement inside a function -- takes a fresh
+  -- snapshot, so a turn can straddle another player's commit. SERIALIZABLE
+  -- gives every transaction one snapshot and aborts anything that could not
+  -- have happened in some serial order.
+  --
+  -- The cost is that transactions can now fail with serialization_failure
+  -- (SQLSTATE 40001) and are expected to be retried. Nothing here retries yet;
+  -- with one player there is nothing to conflict with, and when concurrency
+  -- arrives those failures are the lesson.
+  EXECUTE format('ALTER DATABASE %I SET default_transaction_isolation = %L',
+                 current_database(), 'serializable');
+END $$;
