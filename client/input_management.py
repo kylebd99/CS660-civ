@@ -29,10 +29,10 @@ MOUSE_ON = "\x1b[?1000;1006h"
 MOUSE_OFF = "\x1b[?1000;1006l"
 
 
-# Shift+arrow pans the view. A hex is two columns wide, so a horizontal step of
-# two keeps whole hexes under the cursor.
+# Shift+arrow pans the view, in tiles. The caller decides what a step means;
+# this table only says which key goes which way.
 PAN = {"\x1b[1;2A": (0, 2), "\x1b[1;2B": (0, -2),
-       "\x1b[1;2C": (4, 0), "\x1b[1;2D": (-4, 0)}
+       "\x1b[1;2C": (2, 0), "\x1b[1;2D": (-2, 0)}
 
 
 MOUSE_REPORT = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")

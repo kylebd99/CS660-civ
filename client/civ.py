@@ -22,7 +22,7 @@ import render
 # Every query the client makes, in one place. None of them encode game rules:
 # the views and functions in sql/ do that.
 
-WORLD = "SELECT turn, radius, seed FROM world"
+WORLD = "SELECT turn, width, height, seed FROM world"
 
 CIV = """SELECT civ_id, name, colour, gold, science, researching
          FROM civ WHERE civ_id = %s"""
@@ -31,20 +31,20 @@ ALL_CIVS = "SELECT civ_id, name, colour FROM civ ORDER BY civ_id"
 
 FIRST_CIV = "SELECT min(civ_id) AS civ_id FROM civ"
 
-# Only the rectangle of hexes the terminal can show. The same four numbers go
+# Only the rectangle of tiles the terminal can show. The same four numbers go
 # to draw_map, so the window has one definition rather than two.
-TILES = "SELECT q, r, glyph, colour FROM map_window(%s, %s, %s, %s)"
+TILES = "SELECT x, y, glyph, colour FROM map_window(%s, %s, %s, %s)"
 
 # Where to look when you have not said: your first city, else your first unit.
-VIEW_HOME = """SELECT q, r FROM (
-                 SELECT t.q, t.r, 0 AS rank FROM city c
+VIEW_HOME = """SELECT x, y FROM (
+                 SELECT t.x, t.y, 0 AS rank FROM city c
                    JOIN tile t ON t.tile_id = c.tile_id WHERE c.civ_id = %s
                  UNION ALL
-                 SELECT t.q, t.r, 1 FROM unit u
+                 SELECT t.x, t.y, 1 FROM unit u
                    JOIN tile t ON t.tile_id = u.tile_id WHERE u.civ_id = %s
                ) home ORDER BY rank LIMIT 1"""
 
-UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left, t.q, t.r, c.colour
+UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left, t.x, t.y, c.colour
            FROM unit u
            JOIN unit_type ut ON ut.code    = u.type
            JOIN tile      t  ON t.tile_id  = u.tile_id
@@ -52,7 +52,7 @@ UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left, t.q, t.r,
            ORDER BY u.unit_id"""
 
 CITIES = """SELECT ci.city_id, ci.civ_id, ci.name, ci.population, ci.food_store,
-                   t.q, t.r, cv.colour, y.food, y.production, y.gold
+                   t.x, t.y, cv.colour, y.food, y.production, y.gold
             FROM city       ci
             JOIN tile       t  ON t.tile_id  = ci.tile_id
             JOIN civ        cv ON cv.civ_id  = ci.civ_id
@@ -62,15 +62,15 @@ CITIES = """SELECT ci.city_id, ci.civ_id, ci.name, ci.population, ci.food_store,
 AVAILABLE_TECH = """SELECT code, name, cost FROM available_tech
                     WHERE civ_id = %s ORDER BY cost, code"""
 
-REACHABLE = "SELECT q, r, cost FROM reachable(%s)"
+REACHABLE = "SELECT x, y, cost FROM reachable(%s)"
 
 MY_UNIT_AT = """SELECT u.unit_id FROM unit u
                 JOIN tile t ON t.tile_id = u.tile_id
-                WHERE t.q = %s AND t.r = %s AND u.civ_id = %s"""
+                WHERE t.x = %s AND t.y = %s AND u.civ_id = %s"""
 
 # -------------------------------------------------------------------- writes
 
-NEW_GAME = "SELECT new_game(%s, %s, %s)"
+NEW_GAME = "SELECT new_game(%s, %s, %s, %s)"
 MOVE_UNIT = "SELECT move_unit(%s, %s, %s) AS cost"
 FOUND_CITY = "SELECT found_city(%s, %s) AS city_id"
 SET_RESEARCH = "SELECT set_research(%s)"
@@ -82,16 +82,10 @@ END_TURN = "SELECT end_turn() AS turn"
 
 
 def view_centre(db, state):
-    """Middle of the view, in screen cells (column, row).
-
-    Screen space rather than hex coordinates, because panning is then plain
-    arithmetic: a hex at (q, r) sits at column 2q + r, row r. Unset, the view
-    follows your own pieces.
-    """
+    """Middle of the view, as a tile (x, y). Unset, it follows your pieces."""
     if state["view"] is None:
         home = db.one(VIEW_HOME, (active_civ(db, state),) * 2)
-        q, r = (home["q"], home["r"]) if home else (0, 0)
-        state["view"] = (2 * q + r, r)
+        state["view"] = (home["x"], home["y"]) if home else (0, 0)
     return state["view"]
 
 
@@ -104,6 +98,7 @@ def use_civ(db, state, civ_id):
     any `:` query act for anyone.
     """
     state["civ_id"] = civ_id
+    state["view"] = None        # look at the new player's own territory
     db.call(SET_SESSION_CIV, (str(civ_id),))
 
 
@@ -125,16 +120,18 @@ def active_civ(db, state):
 # highlighted. `state` holds only presentation: the game itself is in Postgres.
 
 def cmd_new(db, state, args):
-    radius = int(args[0]) if args else 6
-    civs = int(args[1]) if len(args) > 1 else 1
-    seed = int(args[2]) if len(args) > 2 else 42
-    db.call(NEW_GAME, (radius, seed, civs))
+    width = int(args[0]) if args else 30
+    height = int(args[1]) if len(args) > 1 else 16
+    civs = int(args[2]) if len(args) > 2 else 1
+    seed = int(args[3]) if len(args) > 3 else 42
+    db.call(NEW_GAME, (width, height, seed, civs))
     state["civ_id"] = None      # whoever you were does not exist any more
+    state["view"] = None
 
 
 def cmd_move(db, state, args):
-    unit, q, r = int(args[0]), int(args[1]), int(args[2])
-    db.call(MOVE_UNIT, (unit, q, r))
+    unit, x, y = int(args[0]), int(args[1]), int(args[2])
+    db.call(MOVE_UNIT, (unit, x, y))
 
 
 def cmd_found(db, state, args):
@@ -153,7 +150,7 @@ def cmd_research(db, state, args):
 
 def cmd_reach(db, state, args):
     unit = int(args[0])
-    state["highlight"] = {(row["q"], row["r"]) for row in db.rows(REACHABLE, (unit,))}
+    state["highlight"] = {(row["x"], row["y"]) for row in db.rows(REACHABLE, (unit,))}
     state["log"].append(db.rendered(REACHABLE, (unit,)))
 
 
@@ -171,13 +168,12 @@ def cmd_sql(db, state, args):
 
 
 def cmd_view(db, state, args):
-    """Centre the view on a hex. `v` alone goes back to following your pieces,
+    """Centre the view on a tile. `v` alone goes back to following your pieces,
     which is also what shift+arrow panning steps away from."""
     if not args:
         state["view"] = None
         return
-    q, r = int(args[0]), int(args[1])
-    state["view"] = (2 * q + r, r)
+    state["view"] = (int(args[0]), int(args[1]))
 
 
 def cmd_play_as(db, state, args):
@@ -206,14 +202,14 @@ def cmd_quit(db, state, args):
 
 
 COMMANDS = {
-    "n": (cmd_new,      "n [radius] [civs] [seed]  start a new game"),
-    "m": (cmd_move,     "m <unit> <q> <r>    move a unit"),
+    "n": (cmd_new,      "n [w] [h] [civs] [seed]   start a new game"),
+    "m": (cmd_move,     "m <unit> <x> <y>    move a unit"),
     "c": (cmd_found,    "c <unit> <name>     found a city with a settler"),
     "t": (cmd_research, "t [tech]            list or choose research"),
     "s": (cmd_reach,    "s <unit>            highlight where a unit can go"),
     "e": (cmd_end,      "e                   end the turn"),
     "p": (cmd_play_as,  "p [civ]             list civs, or play as one"),
-    "v": (cmd_view,     "v [q r]             centre the view (shift+arrows pan)"),
+    "v": (cmd_view,     "v [x y]             centre the view (shift+arrows pan)"),
     ":": (cmd_sql,      ": <sql>             run SQL against the live game"),
     "?": (cmd_help,     "?                   this list"),
     "q": (cmd_quit,     "q                   quit"),
@@ -246,20 +242,19 @@ def screen(db, state):
     # block, two blank lines, the unit line, a possible note, the log and the
     # prompt.
     columns, rows = shutil.get_terminal_size((80, 24))
-    map_cols = max(20, columns - 1)
-    map_rows = max(5, rows - (len(status) + 10))
+    wide = max(10, (columns - 1) // render.CELL_WIDTH)
+    high = max(5, rows - (len(status) + 10))
     cx, cy = view_centre(db, state)
-    window = (cx - map_cols // 2, cx + map_cols // 2,
-              cy - map_rows // 2, cy + map_rows // 2)
+    window = (cx - wide // 2, cx + wide // 2, cy - high // 2, cy + high // 2)
 
     tiles = db.rows(TILES, window)
     map_lines, origin = render.draw_map(tiles, units, cities, state["highlight"],
                                         window=window)
 
     # Remember where the map landed on screen, so a mouse click can be turned
-    # back into a hex. One blank line separates it from the status block.
+    # back into a tile. One blank line separates it from the status block.
     state["map_at"] = (len(status) + 1, origin)
-    state["map_hexes"] = {(t["q"], t["r"]) for t in tiles}
+    state["map_tiles"] = {(t["x"], t["y"]) for t in tiles}
 
     return [*status,
             "",
@@ -270,8 +265,8 @@ def screen(db, state):
             *render.draw_log(state["log"])]
 
 
-def hex_clicked(state, column, row):
-    """The hex under a click, or None if it missed the map.
+def tile_clicked(state, column, row):
+    """The tile under a click, or None if it missed the map.
 
     Mouse reports count from 1 and so do terminal rows, while the frame is a
     list starting at 0.
@@ -282,25 +277,25 @@ def hex_clicked(state, column, row):
     line = (row - 1) - first_line
     if line < 0:
         return None
-    spot = render.hex_at(origin, line, column - 1)
-    return spot if spot in state["map_hexes"] else None
+    spot = render.tile_at(origin, line, column - 1)
+    return spot if spot in state["map_tiles"] else None
 
 
 def click(db, state, line, column, row):
     """A click either picks one of your units or names a destination for the
     one already picked, leaving a command ready for you to check and send."""
-    spot = hex_clicked(state, column, row)
+    spot = tile_clicked(state, column, row)
     if spot is None:
         return
-    q, r = spot
-    unit = db.one(MY_UNIT_AT, (q, r, active_civ(db, state)))
+    x, y = spot
+    unit = db.one(MY_UNIT_AT, (x, y, active_civ(db, state)))
     if unit:
         dispatch(db, state, f"s {unit['unit_id']}")
         line["text"] = f"m {unit['unit_id']} "
     else:
         picked = re.fullmatch(r"m (\d+) ?", line["text"])
         if picked:
-            line["text"] = f"m {picked.group(1)} {q} {r}"
+            line["text"] = f"m {picked.group(1)} {x} {y}"
 
 
 def dispatch(db, state, line):

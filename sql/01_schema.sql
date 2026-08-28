@@ -2,8 +2,8 @@
 -- it draws what it reads and nothing more. If you want to know what the game
 -- is, read this file.
 --
--- The map is a hexagon of hexes addressed by axial coordinates (q, r).
--- See sql/02_hex.sql for the two functions that define hex geometry.
+-- The map is a rectangle of square tiles addressed by (x, y), x running east
+-- and y north. See sql/02_grid.sql for the functions that define geometry.
 
 DROP SCHEMA IF EXISTS game CASCADE;
 CREATE SCHEMA game;
@@ -54,7 +54,8 @@ CREATE TABLE tech_prereq (
 CREATE TABLE world (
   id     int PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   turn   int NOT NULL DEFAULT 1,
-  radius int NOT NULL,
+  width  int NOT NULL,
+  height int NOT NULL,
   seed   int NOT NULL
 );
 
@@ -69,19 +70,14 @@ CREATE TABLE civ (
 
 CREATE TABLE tile (
   tile_id bigserial PRIMARY KEY,
-  q       int  NOT NULL,
-  r       int  NOT NULL,
+  x       int  NOT NULL,
+  y       int  NOT NULL,
   terrain text NOT NULL REFERENCES terrain,
-  -- This is the index the performance demo drops and rebuilds. Every lookup
-  -- the movement rules do goes through (q, r).
-  UNIQUE (q, r)
+  -- The index the performance demo drops and rebuilds. It serves both kinds
+  -- of lookup a square grid needs: a single tile by coordinate, and the
+  -- rectangle the renderer asks for, which is a range over x with y filtered.
+  UNIQUE (x, y)
 );
-
--- The renderer does not ask for hexes by coordinate, it asks for a rectangle of
--- the screen: a hex at (q, r) is drawn at column 2q + r, row r. So the query it
--- runs is a range over r and over the expression 2q + r, and neither is served
--- well by the (q, r) index above. An expression index makes it a range scan.
-CREATE INDEX tile_screen ON tile (r, (2 * q + r));
 
 CREATE TABLE city (
   city_id    serial PRIMARY KEY,
@@ -93,7 +89,7 @@ CREATE TABLE city (
 );
 
 -- Which tiles each city works. The UNIQUE(tile_id) is the interesting part:
--- it is what stops two cities harvesting the same hex, and it is enforced by
+-- it is what stops two cities harvesting the same tile, and it is enforced by
 -- the database rather than by any line of application code.
 CREATE TABLE city_tile (
   city_id int    NOT NULL REFERENCES city ON DELETE CASCADE,
@@ -111,7 +107,7 @@ CREATE TABLE unit (
   moves_left int    NOT NULL CHECK (moves_left >= 0)
 );
 
--- At most one unit per hex. Under concurrent turns this is the constraint that
+-- At most one unit per tile. Under concurrent turns this is the constraint that
 -- turns a silent corruption into a loud, recoverable error.
 CREATE UNIQUE INDEX unit_one_per_tile ON unit (tile_id);
 

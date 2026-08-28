@@ -6,12 +6,12 @@
 SET search_path TO game, public;
 
 -- ------------------------------------------------------------- the economy
--- A city claims a lot of hexes but can only work one per citizen, so it works
+-- A city claims a lot of tiles but can only work one per citizen, so it works
 -- its best ones. Ranking within each city is a window function; the cut-off
 -- depends on that city's population, which is why this is a separate view
 -- from the aggregate below.
 CREATE VIEW city_worked AS
-SELECT r.city_id, r.tile_id, r.food, r.production, r.gold
+SELECT y.city_id, y.tile_id, y.food, y.production, y.gold
 FROM (
   SELECT ct.city_id, ct.tile_id, te.food, te.production, te.gold,
          ROW_NUMBER() OVER (PARTITION BY ct.city_id
@@ -20,9 +20,9 @@ FROM (
   FROM city_tile ct
   JOIN tile    ti ON ti.tile_id = ct.tile_id
   JOIN terrain te ON te.code    = ti.terrain
-) r
-JOIN city c ON c.city_id = r.city_id
-WHERE r.pick <= c.population;
+) y
+JOIN city c ON c.city_id = y.city_id
+WHERE y.pick <= c.population;
 
 -- The entire economic engine of the game: one aggregate over the tiles each
 -- city works. There is no other source of food, production or gold anywhere
@@ -62,43 +62,46 @@ WHERE NOT EXISTS (                                  -- ...not already known
 -- ------------------------------------------------------------- the map
 -- Flattened map rows, so the client never joins anything.
 CREATE VIEW map AS
-SELECT ti.tile_id, ti.q, ti.r, ti.terrain,
+SELECT ti.tile_id, ti.x, ti.y, ti.terrain,
        te.glyph, te.colour, te.passable, te.move_cost
 FROM tile ti JOIN terrain te ON te.code = ti.terrain;
 
 -- The slice of the map a terminal can actually show.
 --
--- The rectangle is given in *screen* cells rather than hex coordinates,
--- because that is what a viewport is: a hex at (q, r) is drawn at column
--- 2q + r and row r. 
-CREATE FUNCTION map_window(_col_min int, _col_max int, _row_min int, _row_max int)
-RETURNS TABLE (q int, r int, glyph text, colour int)
+-- The rectangle is in tile coordinates. How a tile becomes a screen cell is
+-- the renderer's business; the database does not need to know.
+--
+-- Windowing here rather than in the client is the whole point: a world can
+-- have millions of tiles and a terminal can show a few hundred, so redrawing
+-- is an index range scan instead of a read of the world.
+CREATE FUNCTION map_window(_x_min int, _x_max int, _y_min int, _y_max int)
+RETURNS TABLE (x int, y int, glyph text, colour int)
 LANGUAGE sql STABLE AS $$
-  SELECT t.q, t.r, te.glyph, te.colour
+  SELECT t.x, t.y, te.glyph, te.colour
   FROM tile t JOIN terrain te ON te.code = t.terrain
-  WHERE t.r BETWEEN _row_min AND _row_max
-    AND 2 * t.q + t.r BETWEEN _col_min AND _col_max;
+  WHERE t.x BETWEEN _x_min AND _x_max
+    AND t.y BETWEEN _y_min AND _y_max;
 $$;
 
 -- ------------------------------------------------------------- movement
 -- Where a unit could walk with the movement it has left, as a recursive walk
--- over hex adjacency accumulating terrain move costs.
+-- over tile adjacency accumulating terrain move costs.
 CREATE FUNCTION reachable(_unit int)
-RETURNS TABLE (tile_id bigint, q int, r int, cost int)
+RETURNS TABLE (tile_id bigint, x int, y int, cost int)
 LANGUAGE sql STABLE AS $$
   WITH RECURSIVE walk AS (
-    SELECT t.tile_id, t.q, t.r, 0 AS cost, u.moves_left
+    SELECT t.tile_id, t.x, t.y, 0 AS cost, u.moves_left
     FROM unit u JOIN tile t ON t.tile_id = u.tile_id
     WHERE u.unit_id = _unit
   UNION ALL
-    SELECT nt.tile_id, nt.q, nt.r, w.cost + te.move_cost, w.moves_left
+    SELECT nt.tile_id, nt.x, nt.y, w.cost + te.move_cost, w.moves_left
     FROM walk w
-    JOIN hex_neighbours(w.q, w.r) n ON true
-    JOIN tile    nt ON nt.q = n.q AND nt.r = n.r
+    JOIN neighbours(w.x, w.y) n ON true
+    JOIN tile    nt ON nt.x = n.x AND nt.y = n.y
     JOIN terrain te ON te.code = nt.terrain
     WHERE te.passable
       AND w.cost + te.move_cost <= w.moves_left
   )
-  SELECT w.tile_id, w.q, w.r, min(w.cost)::int
-  FROM walk w GROUP BY w.tile_id, w.q, w.r;
+  SELECT w.tile_id, w.x, w.y, min(w.cost)::int
+  FROM walk w GROUP BY w.tile_id, w.x, w.y;
 $$;

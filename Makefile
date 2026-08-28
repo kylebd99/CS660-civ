@@ -16,7 +16,7 @@ up:
 # not inside the container.
 reset: up
 	@for f in sql/*.sql; do echo "  loading $$f"; $(PSQL) < $$f || exit 1; done
-	@$(PSQL) -c "SELECT game.new_game(6, 42, 1)" >/dev/null
+	@$(PSQL) -c "SELECT game.new_game(42, 42, 3)" >/dev/null
 	@echo "new world dealt -- run 'make play'"
 
 play:

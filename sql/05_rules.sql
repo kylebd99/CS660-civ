@@ -25,12 +25,13 @@ END $$;
 -- --------------------------------------------------------------- new_game
 -- Wipe the world and deal a fresh one. Terrain is a pure function of the seed,
 -- so the same seed always produces the same map.
-CREATE FUNCTION new_game(_radius int DEFAULT 6, _seed int DEFAULT 42, _civs int DEFAULT 1)
+CREATE FUNCTION new_game(_width int DEFAULT 30, _height int DEFAULT 16,
+                         _seed int DEFAULT 42, _civs int DEFAULT 1)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   names   text[] := ARRAY['Rome', 'Carthage', 'Egypt', 'Persia'];
   colours int[]  := ARRAY[203, 75, 179, 114];
-  i int; cid int; home bigint; home_q int; home_r int; guard bigint;
+  i int; cid int; home bigint; home_x int; home_y int; guard bigint;
 BEGIN
   IF _civs < 1 OR _civs > array_length(names, 1) THEN
     RAISE EXCEPTION 'civs must be between 1 and %', array_length(names, 1);
@@ -40,35 +41,35 @@ BEGIN
   -- resets, and the first unit of a fresh game is #47 instead of #1.
   TRUNCATE civ_tech, unit, city_tile, city, civ, tile, world RESTART IDENTITY CASCADE;
 
-  INSERT INTO world (id, turn, radius, seed) VALUES (1, 1, _radius, _seed);
+  INSERT INTO world (id, turn, width, height, seed)
+  VALUES (1, 1, _width, _height, _seed);
 
-  -- The map is every hex within _radius of the origin.
-  INSERT INTO tile (q, r, terrain)
-  SELECT q, r, terrain_at(q, r, _seed)
-  FROM generate_series(-_radius, _radius) AS q,
-       generate_series(-_radius, _radius) AS r
-  WHERE abs(q + r) <= _radius;
+  -- The map is the whole rectangle, origin at the south-west corner.
+  INSERT INTO tile (x, y, terrain)
+  SELECT x, y, terrain_at(x, y, _seed)
+  FROM generate_series(0, _width - 1) AS x,
+       generate_series(0, _height - 1) AS y;
 
   FOR i IN 1.._civs LOOP
     INSERT INTO civ (name, colour) VALUES (names[i], colours[i]) RETURNING civ_id INTO cid;
 
-    -- Spread starting positions evenly around the map, then snap to the
-    -- nearest land hex nobody is standing on.
-    SELECT t.tile_id, t.q, t.r INTO home, home_q, home_r
+    -- Space the civs evenly across the middle of the map, then snap to the
+    -- nearest land tile nobody is standing on.
+    SELECT t.tile_id, t.x, t.y INTO home, home_x, home_y
     FROM tile t JOIN terrain te ON te.code = t.terrain
     WHERE te.passable AND NOT EXISTS (SELECT 1 FROM unit u WHERE u.tile_id = t.tile_id)
-    ORDER BY hex_distance(t.q, t.r,
-                          round(_radius * 0.55 * cos(2 * pi() * (i - 1) / _civs))::int,
-                          round(_radius * 0.55 * sin(2 * pi() * (i - 1) / _civs))::int)
+    ORDER BY distance(t.x, t.y,
+                      (_width * (2 * i - 1) / (2 * _civs))::int,
+                      (_height / 2)::int)
     LIMIT 1;
 
     INSERT INTO unit (civ_id, type, tile_id, hp, moves_left)
     SELECT cid, 'settler', home, ut.max_hp, ut.moves FROM unit_type ut WHERE ut.code = 'settler';
 
-    -- An escort on any free neighbouring land hex.
+    -- An escort on any free neighbouring land tile.
     SELECT t.tile_id INTO guard
-    FROM hex_neighbours(home_q, home_r) n
-    JOIN tile t    ON t.q = n.q AND t.r = n.r
+    FROM neighbours(home_x, home_y) n
+    JOIN tile t    ON t.x = n.x AND t.y = n.y
     JOIN terrain te ON te.code = t.terrain
     WHERE te.passable AND NOT EXISTS (SELECT 1 FROM unit u WHERE u.tile_id = t.tile_id)
     LIMIT 1;
@@ -81,7 +82,7 @@ BEGIN
 END $$;
 
 -- --------------------------------------------------------------- found_city
--- Turn a settler into a city, which claims the workable hexes around it.
+-- Turn a settler into a city, which claims the workable tiles around it.
 CREATE FUNCTION found_city(_unit int, _name text)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE u record; new_city int;
@@ -93,7 +94,7 @@ BEGIN
     RAISE EXCEPTION 'unit % is not yours', _unit;
   END IF;
 
-  SELECT un.unit_id, un.civ_id, un.tile_id, t.q, t.r INTO u
+  SELECT un.unit_id, un.civ_id, un.tile_id, t.x, t.y INTO u
   FROM unit un
   JOIN tile      t  ON t.tile_id = un.tile_id
   JOIN unit_type ut ON ut.code   = un.type
@@ -106,13 +107,13 @@ BEGIN
   INSERT INTO city (civ_id, tile_id, name) VALUES (u.civ_id, u.tile_id, _name)
   RETURNING city_id INTO new_city;
 
-  -- Claim every yielding hex within two rings that no other city holds.
-  -- ON CONFLICT is doing real work: city_tile.tile_id is UNIQUE, so a hex
+  -- Claim every yielding tile within two rings that no other city holds.
+  -- ON CONFLICT is doing real work: city_tile.tile_id is UNIQUE, so a tile
   -- already worked by a neighbour is simply skipped.
   INSERT INTO city_tile (city_id, tile_id)
   SELECT new_city, t.tile_id
   FROM tile t JOIN terrain te ON te.code = t.terrain
-  WHERE hex_distance(t.q, t.r, u.q, u.r) BETWEEN 1 AND 2
+  WHERE distance(t.x, t.y, u.x, u.y) BETWEEN 1 AND 2
     AND te.food + te.production + te.gold > 0
   ON CONFLICT (tile_id) DO NOTHING;
 
@@ -121,9 +122,9 @@ BEGIN
 END $$;
 
 -- --------------------------------------------------------------- move_unit
--- Walk a unit to (_q, _r) if it can afford to get there. Legality is decided
+-- Walk a unit to (_x, _y) if it can afford to get there. Legality is decided
 -- by the reachable() query, so the rules of movement live in exactly one place.
-CREATE FUNCTION move_unit(_unit int, _q int, _r int)
+CREATE FUNCTION move_unit(_unit int, _x int, _y int)
 RETURNS int LANGUAGE plpgsql AS $$
 DECLARE dest bigint; spent int;
 BEGIN
@@ -133,10 +134,10 @@ BEGIN
   END IF;
 
   SELECT rc.tile_id, rc.cost INTO dest, spent
-  FROM reachable(_unit) rc WHERE rc.q = _q AND rc.r = _r;
+  FROM reachable(_unit) rc WHERE rc.x = _x AND rc.y = _y;
 
   IF dest IS NULL THEN
-    RAISE EXCEPTION 'unit % cannot reach (%, %) this turn', _unit, _q, _r;
+    RAISE EXCEPTION 'unit % cannot reach (%, %) this turn', _unit, _x, _y;
   END IF;
 
   -- If another unit is standing there, unit_one_per_tile rejects this update.
