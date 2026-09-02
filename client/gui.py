@@ -12,6 +12,7 @@ can read from the back of a lecture hall.
     python3 client/gui.py            two windows on one database are two players
 """
 
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -265,7 +266,10 @@ def read_world(db, session, view, size):
     board = board_for(bands.map, game.view_centre(db, session), tile_px)
     cells, highest = game.tiles_in(db, session, board.window)
     world = {"bands": bands, "snap": snap, "board": board,
-             "cells": cells, "highest": highest}
+             "cells": cells, "highest": highest,
+             # Which column the cells came out of, kept with them so the
+             # legend can caption itself with the call that produced them.
+             "overlay": session.overlay}
 
     # A tray's rows are read while it is open and not otherwise: three more
     # statements per frame to keep a closed menu up to date would be three
@@ -540,6 +544,9 @@ def draw_context(surface, rect, snap, view, world, legend, ui):
         else:
             button(surface, slot, "Found city", ui)
 
+    draw_legend(surface, rect, view, world, legend, line, ui)
+    line += round(30 * ui)
+
     if not units:
         write(surface, "no units", (rect.left + pad, line), size=size,
               colour=FAINT)
@@ -645,6 +652,52 @@ def rail_toggle(rect, ui):
         slots[name] = slot
         right -= width + round(14 * ui)
     return slots
+
+
+def draw_legend(surface, rect, view, world, legend, line, ui):
+    """What the colours mean.
+
+    With an overlay on, a gradient from nothing to the best in view, captioned
+    with the call the numbers came out of -- the caption is the point: the
+    hills lighting up when Mining lands is gathering_rate changing, and the
+    statement says so. With no overlay, the terrain chips, which are the
+    terminal's own glyphs and colours so the two front-ends line up.
+    """
+    pad = round(16 * ui)
+    at = rect.left + pad
+
+    if world["highest"] is not None:
+        # One chip per colour the scale can actually reach, which for a
+        # 0-to-2 map is three and not ten: a ramp showing colours no tile in
+        # view could be would be a legend for a different map.
+        highest = world["highest"]
+        steps = min(highest + 1, len(render.HEAT))
+        step = round(26 * ui)
+        for bucket in range(steps):
+            value = bucket * (highest + 1) // steps
+            chip = pygame.Rect(at, line, step, round(18 * ui))
+            surface.fill(palette.rgb(render.heat(value, highest)), chip)
+            at += step
+        write(surface, f"0 to {highest}", (at + round(10 * ui),
+                                           line + round(9 * ui)),
+              size=round(18 * ui), colour=MUTED, anchor="midleft")
+        window = ", ".join(str(n) for n in world["board"].window)
+        write(surface, f"{world['overlay']} from yield_window("
+                       f"{world['snap']['civ_id']}, {window})",
+              (rect.right - pad, line + round(9 * ui)), size=round(17 * ui),
+              colour=FAINT, anchor="midright")
+        return
+
+    for kind in legend.values():
+        colour = palette.dim(palette.rgb(kind["colour"]), TERRAIN_DIM)
+        chip = pygame.Rect(at, line, round(18 * ui), round(18 * ui))
+        surface.fill(colour, chip)
+        write(surface, kind["glyph"], chip.center, size=round(15 * ui),
+              colour=palette.readable_on(colour), anchor="center")
+        drawn = write(surface, kind["code"], (chip.right + round(6 * ui),
+                                              chip.centery),
+                      size=round(17 * ui), colour=MUTED, anchor="midleft")
+        at = drawn.right + round(16 * ui)
 
 
 def draw_rail(surface, rect, session, view, world, db, ui):
@@ -1579,10 +1632,31 @@ def maybe_centre(db, session, view, board, pos):
 
 # ---------------------------------------------------------------------- loop
 
+HALF_SIZE = (DEFAULT_SIZE[0] // 2, DEFAULT_SIZE[1])
+
+
+def open_window(size):
+    """Open the window, falling back to X11 if the chosen driver will not.
+
+    On a Wayland session SDL sometimes picks a driver it cannot actually open;
+    XWayland is there in that situation, so trying x11 is a better answer than
+    a traceback in front of a room.
+    """
+    try:
+        return pygame.display.set_mode(size, pygame.RESIZABLE)
+    except pygame.error:
+        os.environ["SDL_VIDEODRIVER"] = "x11"
+        pygame.display.quit()
+        pygame.display.init()
+        return pygame.display.set_mode(size, pygame.RESIZABLE)
+
+
 def main():
     pygame.init()
     pygame.display.set_caption("civ")
-    surface = pygame.display.set_mode(DEFAULT_SIZE, pygame.RESIZABLE)
+    # --half opens straight into the narrow layout, which is how two players
+    # fit side by side on one projector.
+    surface = open_window(HALF_SIZE if "--half" in sys.argv else DEFAULT_SIZE)
     clock = pygame.time.Clock()
 
     session = game.Session()

@@ -1369,3 +1369,140 @@ def test_the_preview_costs_no_statement(rome):
         view.hover = spot
         gui.would_send(db, view, world)
     assert (db.quiet, len(session.log)) == (before, logged)
+
+
+# ------------------------------------------------------------- two players
+# Two windows on one database are two players. That is the whole reason the
+# civ lives in a session setting rather than in a variable in this file, and it
+# is what Lectures 21-22 want to show rather than describe.
+
+@pytest.fixture
+def two_windows(game, dsn):
+    """Two independent clients on one world, playing different civs."""
+    made = []
+    for civ in (1, 2):
+        session, view = core.Session(), gui.View()
+        db = dbapi.DB(dsn=dsn, echo=session.log.append)
+        core.use_civ(db, session, civ)
+        made.append((db, session, view))
+    return made
+
+
+def test_each_window_plays_its_own_civ(two_windows):
+    (rome_db, rome, _), (carthage_db, carthage, _) = two_windows
+    assert (rome.civ_id, carthage.civ_id) == (1, 2)
+    assert rome_db.one("SELECT current_civ() AS me")["me"] == 1
+    assert carthage_db.one("SELECT current_civ() AS me")["me"] == 2
+
+
+def test_one_window_sees_the_others_move_on_the_next_poll(two_windows):
+    """No LISTEN, no triggers: the world is re-read on a timer, and a rival's
+    move turns up in the rows the next read returns."""
+    (rome_db, rome, rome_view), (carthage_db, carthage, _) = two_windows
+
+    before = gui.read_world(rome_db, rome, rome_view, gui.DEFAULT_SIZE)
+    core.look_at(rome, 19, 9)
+    before = gui.read_world(rome_db, rome, rome_view, gui.DEFAULT_SIZE)
+    assert gui.occupant(before, 19, 9)["unit_id"] == 4
+
+    core.move(carthage_db, 4, 19, 8)               # their warrior, their turn
+    after = gui.read_world(rome_db, rome, rome_view, gui.DEFAULT_SIZE)
+    assert gui.occupant(after, 19, 9) is None
+    assert gui.occupant(after, 19, 8)["unit_id"] == 4
+
+
+def test_a_window_cannot_pick_up_the_others_units(two_windows):
+    (rome_db, rome, rome_view), _ = two_windows
+    core.look_at(rome, 19, 9)
+    world = gui.read_world(rome_db, rome, rome_view, gui.DEFAULT_SIZE)
+
+    click_on(rome_db, rome, rome_view, world, world["board"], (19, 9))
+    assert rome_view.selected is None
+    # And sending one anyway is refused by the server, not by this client.
+    rome_view.selected = 4
+    gui.act_on(rome_db, rome, rome_view, world, 19, 8)
+    assert "not yours" in rome_view.trouble
+
+
+def test_the_two_windows_are_told_apart_by_colour(two_windows):
+    """The civ chip is filled with civ.colour, so you know which window is
+    Rome without reading anything -- which matters when both are projected."""
+    (rome_db, rome, rome_view), (carthage_db, carthage, carthage_view) = two_windows
+    frames = []
+    for db, session, view in two_windows:
+        world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+        surface = pygame.Surface(gui.DEFAULT_SIZE)
+        gui.draw(surface, world, session, view, {}, db)
+        frames.append((surface, world))
+
+    colours = [palette.rgb(world["snap"]["civ"]["colour"])
+               for _surface, world in frames]
+    assert colours[0] != colours[1]
+    for (surface, _world), colour in zip(frames, colours):
+        strip = {surface.get_at((x, 20))[:3] for x in range(100, 260)}
+        assert colour in strip
+
+
+def test_both_windows_read_the_same_tiles(two_windows):
+    (rome_db, rome, rome_view), (carthage_db, carthage, carthage_view) = two_windows
+    core.look_at(rome, 12, 8)
+    core.look_at(carthage, 12, 8)
+    mine = gui.read_world(rome_db, rome, rome_view, gui.DEFAULT_SIZE)
+    theirs = gui.read_world(carthage_db, carthage, carthage_view, gui.DEFAULT_SIZE)
+
+    assert mine["board"].window == theirs["board"].window
+    assert mine["cells"] == theirs["cells"]
+    # Fog of war is deliberately not built: you can see a rival standing there.
+    assert len(mine["snap"]["units"]) == len(theirs["snap"]["units"]) == 4
+    assert {u["unit_id"] for u in mine["snap"]["my_units"]} == {1, 2}
+    assert {u["unit_id"] for u in theirs["snap"]["my_units"]} == {3, 4}
+
+
+def test_ending_the_turn_in_one_window_advances_it_in_both(two_windows):
+    """The turn is global and unchanged by any of this: end_turn advances the
+    whole world for every civ at once."""
+    (rome_db, rome, rome_view), (carthage_db, carthage, carthage_view) = two_windows
+    core.end_turn(rome_db)
+    assert core.snapshot(carthage_db, carthage)["world"]["turn"] == 2
+
+
+# ------------------------------------------------------------- the overlays
+
+@pytest.mark.parametrize("column", ["food", "production", "gold"])
+def test_every_overlay_draws_its_numbers_and_its_legend(column, rome):
+    db, session = rome
+    view = gui.View()
+    session.overlay = column
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    assert world["overlay"] == column
+    assert all(column not in cell for cell in world["cells"])   # reshaped
+    assert all("value" in cell for cell in world["cells"])
+
+    surface = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(surface, world, session, view, core.terrain_legend(db), db)
+    # The gradient legend is in the context strip, in the heat ramp's colours.
+    strip = world["bands"].context
+    pixels = {surface.get_at((x, y))[:3]
+              for x in range(strip.left, strip.left + 300)
+              for y in range(strip.top, strip.bottom, 2)}
+    # Both ends of the scale that is actually in view -- which for a 0-to-2
+    # food map is three colours out of the ten, not the whole ramp.
+    assert palette.rgb(render.heat(0, world["highest"])) in pixels
+    assert palette.rgb(render.heat(world["highest"], world["highest"])) in pixels
+
+
+def test_the_terrain_legend_is_drawn_when_no_overlay_is(rome):
+    """The terminal's own glyphs and colours, so the two front-ends line up."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    surface = pygame.Surface(gui.DEFAULT_SIZE)
+    legend = core.terrain_legend(db)
+    gui.draw(surface, world, session, view, legend, db)
+
+    strip = world["bands"].context
+    pixels = {surface.get_at((x, y))[:3]
+              for x in range(strip.left, strip.left + 600)
+              for y in range(strip.top, strip.bottom, 2)}
+    for kind in legend.values():
+        assert palette.dim(palette.rgb(kind["colour"]), gui.TERRAIN_DIM) in pixels
