@@ -155,6 +155,16 @@ def available_techs(db, civ_id):
     return db.rows(q.AVAILABLE_TECH, (civ_id,))
 
 
+def terrain_legend(db):
+    """What each kind of tile is called, keyed by the glyph the map carries.
+
+    Read once, not per frame: the terrain table is seed data and does not
+    change while a game is running. It is what lets a front-end name the tile
+    under the cursor without asking the database again on every mouse move.
+    """
+    return {row["glyph"]: row for row in db.rows(q.TERRAIN_LEGEND)}
+
+
 def my_unit_at(db, x, y, civ_id):
     row = db.one(q.MY_UNIT_AT, (x, y, civ_id))
     return row["unit_id"] if row else None

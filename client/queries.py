@@ -41,7 +41,7 @@ VIEW_HOME = """SELECT x, y FROM (
                ) home ORDER BY rank, x, y LIMIT 1"""
 
 UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left,
-                  u.actions_left, u.hp, t.x, t.y, c.colour
+                  u.actions_left, u.hp, ut.max_hp, t.x, t.y, c.colour
            FROM unit u
            JOIN unit_type ut ON ut.code    = u.type
            JOIN tile      t  ON t.tile_id  = u.tile_id
@@ -60,6 +60,11 @@ AVAILABLE_TECH = """SELECT code, name, cost FROM available_tech
                     WHERE civ_id = %s ORDER BY cost, code"""
 
 REACHABLE = "SELECT x, y, cost FROM reachable(%s)"
+
+# Fetched once rather than per frame: the terrain table does not change while
+# a game is running. What each kind of tile is called, and what it looks like.
+TERRAIN_LEGEND = """SELECT code, glyph, colour, food, production, gold
+                    FROM terrain ORDER BY code"""
 
 UNIT_SHOP = """SELECT code, cost, moves, strength, required_tech, unlocked
                FROM unit_shop WHERE civ_id = %s ORDER BY cost"""

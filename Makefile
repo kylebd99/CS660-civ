@@ -1,12 +1,13 @@
 # make up      start postgres
 # make reset   (re)load the schema and deal a new world
 # make play    attach the terminal client
+# make gui     open the windowed client (two of them are two players)
 # make sql     open a psql prompt on the live game
 # make test    run the tests (needs neither docker nor a running postgres)
 
 PSQL := docker compose exec -T db psql -U civ -d civ -v ON_ERROR_STOP=1 -q
 
-.PHONY: up down reset play sql deps dev-deps test demo-economy demo-scale
+.PHONY: up down reset play gui sql deps dev-deps test demo-economy demo-scale
 
 up:
 	docker compose up -d
@@ -22,6 +23,9 @@ reset: up
 
 play:
 	python3 client/civ.py
+
+gui:
+	python3 client/gui.py
 
 sql:
 	docker compose exec db psql -U civ -d civ
