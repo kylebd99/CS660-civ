@@ -34,7 +34,7 @@ class Session:
     civ_id: int | None = None                  # mirrors app.civ_id on the wire
     view: tuple[int, int] | None = None        # None = follow my own pieces
     overlay: str | None = None                 # 'food' | 'production' | 'gold'
-    highlight: set = field(default_factory=set)
+    highlight: dict = field(default_factory=dict)   # (x, y) -> moves to get there
     log: list = field(default_factory=list)    # every statement sent
 
 
@@ -144,7 +144,15 @@ def tiles_in(db, session, window):
 
 
 def reachable(db, unit):
-    return {(row["x"], row["y"]) for row in db.rows(q.REACHABLE, (unit,))}
+    """Where a unit could walk this turn, and what each tile would cost.
+
+    A mapping rather than a set because reachable() computes the cost as it
+    goes and there is no reason to throw it away -- putting the recursive
+    CTE's own output on the map is the cheapest teaching win available. A
+    front-end that only wants the tiles can iterate it like a set.
+    """
+    return {(row["x"], row["y"]): row["cost"]
+            for row in db.rows(q.REACHABLE, (unit,))}
 
 
 def unit_shop(db, civ_id):
@@ -230,7 +238,7 @@ def highlight_reachable(db, session, unit):
 
 
 def clear_highlight(session):
-    session.highlight = set()
+    session.highlight = {}
 
 
 # ------------------------------------------------------------------- overlays

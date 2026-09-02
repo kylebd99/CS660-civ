@@ -219,7 +219,11 @@ class View:
     panning: bool = False
     drag: tuple = (0, 0)                       # unspent drag, in pixels
     escape_armed: bool = False
-    last_click: tuple = (0.0, None)            # for double-click-to-centre
+    last_click: tuple = (0.0, None)            # (when, which tile), for
+                                               # double-click-to-centre
+    selected: int | None = None                # a unit id, like `m 3 ` typed
+    trouble: str = ""                          # the last refusal, shown as-is
+    ants: int = 0                              # marching-ants phase, in pixels
 
     def zoom(self, by):
         step = TILE_STEPS.index(self.tile_px) + by
@@ -287,15 +291,21 @@ def draw_board(surface, board, world, session, view):
                   colour=palette.readable_on(fill[(cell["x"], cell["y"])]),
                   bold=True, anchor="center")
 
-    # Where the selected unit could walk. A wash rather than an outline per
-    # tile, so a 16-tile reachable set reads as one shape.
-    for spot in session.highlight:
+    # Where the selected unit could walk, and what each tile would cost it.
+    # A wash rather than an outline per tile, so a sixteen-tile reachable set
+    # reads as one shape; the number in the corner is the recursive CTE's own
+    # output, which both front-ends used to fetch and throw away.
+    for spot, cost in session.highlight.items():
         rect = board.rect_of(*spot)
-        if board.area.contains(rect):
-            wash = pygame.Surface(rect.size, pygame.SRCALPHA)
-            wash.fill((*INK, 64))
-            surface.blit(wash, rect)
-            pygame.draw.rect(surface, INK, rect.inflate(-4, -4), 1)
+        if not board.area.contains(rect):
+            continue
+        wash = pygame.Surface(rect.size, pygame.SRCALPHA)
+        wash.fill((*INK, 64))
+        surface.blit(wash, rect)
+        pygame.draw.rect(surface, INK, rect.inflate(-4, -4), 1)
+        if cost:
+            write(surface, cost, (rect.left + 3, rect.top + 2),
+                  size=round(px * 0.34), colour=INK)
 
     for city in world["snap"]["cities"]:
         rect = board.rect_of(city["x"], city["y"]).inflate(-px // 6, -px // 6)
@@ -331,10 +341,38 @@ def draw_board(surface, board, world, session, view):
         left = full * unit["hp"] // unit["max_hp"]
         surface.fill(colour, (bar.x, bar.y, left, bar.height))
 
+        if unit["unit_id"] == view.selected:
+            # Marching ants, and the only animation in the window: motion
+            # locates the selection across a lecture hall faster than colour.
+            dashed_rect(surface, INK, rect.inflate(-2, -2), view.ants)
+        elif (view.hover == (unit["x"], unit["y"])
+              and view.selected is not None
+              and unit["civ_id"] != world["snap"]["civ_id"]):
+            # What a click here would do. attack() decides whether it is
+            # allowed; this only says which statement is about to go out.
+            pygame.draw.circle(surface, ALARM, rect.center, px * 0.44, 3)
+
     if view.hover is not None:
         hovered = board.rect_of(*view.hover)
         if board.area.contains(hovered):
             pygame.draw.rect(surface, INK, hovered, 2)
+
+
+def dashed_rect(surface, colour, rect, phase, dash=7, width=3):
+    """A ring of marching ants around `rect`, offset by `phase` pixels.
+
+    The perimeter is walked as a list of points so that the dashes run
+    continuously round the corners; drawing four dashed lines instead makes
+    them stutter where the edges meet.
+    """
+    edge = ([(x, rect.top) for x in range(rect.left, rect.right)]
+            + [(rect.right - 1, y) for y in range(rect.top, rect.bottom)]
+            + [(x, rect.bottom - 1) for x in range(rect.right - 1, rect.left, -1)]
+            + [(rect.left, y) for y in range(rect.bottom - 1, rect.top, -1)])
+    for step in range(0, len(edge), 2):
+        if ((step + phase) // dash) % 2 == 0:
+            x, y = edge[step]
+            surface.fill(colour, (x - width // 2, y - width // 2, width, width))
 
 
 def draw_gutter(surface, board, ui):
@@ -398,6 +436,15 @@ def draw_context(surface, rect, snap, view, world, legend, ui):
     pad = round(16 * ui)
     size = round(22 * ui)
     line = rect.top + pad
+
+    # Whatever the database last refused, in its own words. Showing it is the
+    # point: unit_one_per_tile rejecting a move is a lecture beat, not an
+    # error to be smoothed over.
+    if view.trouble:
+        for chunk in wrap(view.trouble, rect.width - 2 * pad, size)[:2]:
+            write(surface, chunk, (rect.left + pad, line), size=size,
+                  colour=ALARM)
+            line += size
 
     # The hover readout is free: the terrain for every tile in view was already
     # fetched to draw it, so reading it back costs no statement.
@@ -484,16 +531,19 @@ def wrap(statement, width, size):
     return lines + [current] if current else lines
 
 
+KEYS_HELP = ("click a unit then a square to move   arrows step it   "
+             "A attack   C found   S reachable   Space ends the turn   "
+             "drag pans   Home follows   +/- zoom   Esc Esc quits")
+
+
 def draw_prompt(surface, rect, ui):
     """A placeholder until there is something to type into it."""
     if not rect.height:
         return
     surface.fill(PANEL, rect)
     pygame.draw.line(surface, EDGE, rect.topleft, rect.topright)
-    write(surface, "arrows or drag to pan   Home follows your pieces   "
-                   "+/- zoom   F11 log   F12 map   Esc Esc quits",
-          (rect.left + round(16 * ui), rect.centery), size=round(19 * ui),
-          colour=FAINT, anchor="midleft")
+    write(surface, KEYS_HELP, (rect.left + round(16 * ui), rect.centery),
+          size=round(19 * ui), colour=FAINT, anchor="midleft")
 
 
 def draw(surface, world, session, view, legend=None):
@@ -520,9 +570,14 @@ def draw(surface, world, session, view, legend=None):
 
 
 # --------------------------------------------------------------------- input
-# Read-only for now: everything here moves the camera or the window. Returns
-# True to keep the loop going, and True from `stale` to force a re-read rather
-# than waiting out the poll -- latency is only felt on your own actions.
+# Returns True to keep the loop going, and True from `stale` to force a re-read
+# rather than waiting out the poll -- latency is only felt on your own actions.
+#
+# Nothing here checks whether an action is legal. A target on the map is a
+# click, the statement goes out, and if the database refuses it the refusal is
+# what appears on screen. The one exception is which statement to send: an
+# enemy on the tile means attack(), an empty tile means move_unit(), and that
+# is the same choice the terminal player makes by typing `a` or `m`.
 
 PAN_KEYS = {pygame.K_LEFT: (-1, 0), pygame.K_RIGHT: (1, 0),
             pygame.K_DOWN: (0, -1), pygame.K_UP: (0, 1)}
@@ -544,7 +599,7 @@ def handle(event, db, session, view, world):
         return True, True
 
     if event.type == pygame.KEYDOWN:
-        return key_down(event, db, session, view)
+        return key_down(event, db, session, view, world)
 
     board = world.get("board")
 
@@ -559,7 +614,9 @@ def handle(event, db, session, view, world):
         if event.button in (2, 3):
             view.panning, view.drag = True, (0, 0)
         elif event.button == 1 and board is not None:
-            return True, maybe_centre(db, session, view, board, event.pos)
+            if maybe_centre(db, session, view, board, event.pos):
+                return True, True
+            return True, click(db, session, view, world, event.pos)
 
     if event.type == pygame.MOUSEBUTTONUP and event.button in (2, 3):
         view.panning = False
@@ -567,8 +624,15 @@ def handle(event, db, session, view, world):
     return True, False
 
 
-def key_down(event, db, session, view):
+def key_down(event, db, session, view, world):
     if event.key in PAN_KEYS:
+        # Arrows step the selected unit, and pan when nothing is selected. One
+        # keypress, one visible move_unit: the best way to narrate a move.
+        if view.selected is not None and standing(world, view.selected):
+            x, y = standing(world, view.selected)
+            return True, act_on(db, session, view, world,
+                                *(x + PAN_KEYS[event.key][0],
+                                  y + PAN_KEYS[event.key][1]))
         game.pan(db, session, *PAN_KEYS[event.key])
         return True, True
     if event.key in ZOOM_KEYS:
@@ -582,14 +646,136 @@ def key_down(event, db, session, view):
         view.focus = "both" if view.focus == wanted else wanted
         return True, True
     if event.key == pygame.K_ESCAPE:
-        # Twice, deliberately, and there is no quit button. An accidental exit
-        # in front of a lecture hall is unrecoverable theatre.
+        # Escape drops the selection first, and only quits when there is
+        # nothing left to drop -- twice, deliberately, and there is no quit
+        # button. An accidental exit in front of a lecture hall is
+        # unrecoverable theatre.
+        if view.selected is not None or view.trouble:
+            deselect(session, view)
+            return True, False
         if view.escape_armed:
             return False, False
         view.escape_armed = True
         return True, False
+
     view.escape_armed = False
+
+    if event.key == pygame.K_SPACE:
+        view.trouble = ""
+        deselect(session, view)
+        game.end_turn(db)
+        return True, True
+    if event.key == pygame.K_s and view.selected is not None:
+        # The selection already shows this; the key is kept so that the
+        # recursive query can be sent on its own and watched.
+        view.trouble = ""
+        game.highlight_reachable(db, session, view.selected)
+        return True, True
+    if event.key == pygame.K_c and view.selected is not None:
+        return True, try_it(view, lambda: game.found_city(db, view.selected))
+    if event.key == pygame.K_a and view.selected is not None and view.hover:
+        return True, act_on(db, session, view, world, *view.hover)
     return True, False
+
+
+def units_now(world):
+    """Everyone's units as the last poll saw them, which is up to a fifth of a
+    second old -- fine for deciding which statement to send, and never used to
+    decide whether it is allowed."""
+    return world["snap"]["units"] if world.get("snap") else ()
+
+
+def standing(world, unit_id):
+    """Where a unit is, or None if it is gone."""
+    for unit in units_now(world):
+        if unit["unit_id"] == unit_id:
+            return unit["x"], unit["y"]
+    return None
+
+
+def occupant(world, x, y):
+    """Whoever is on a tile, or None."""
+    for unit in units_now(world):
+        if (unit["x"], unit["y"]) == (x, y):
+            return unit
+    return None
+
+
+def try_it(view, action):
+    """Run one action, keeping whatever the database said about it.
+
+    The refusal is the interesting output, so it is kept rather than logged and
+    forgotten -- and a failed action still redraws, because being told no is a
+    change to what is on screen.
+    """
+    view.trouble = ""
+    try:
+        action()
+    except psycopg.Error as exc:
+        view.trouble = str(exc).strip().splitlines()[0]
+    return True
+
+
+def select(db, session, view, unit_id):
+    view.selected = unit_id
+    view.trouble = ""
+    game.highlight_reachable(db, session, unit_id)
+
+
+def deselect(session, view):
+    view.selected = None
+    view.trouble = ""
+    game.clear_highlight(session)
+
+
+def click(db, session, view, world, pos):
+    """Click one of your units to pick it, then a square to send it there.
+
+    The same two-phase gesture as the terminal's, where picking a unit leaves
+    `m 3 ` in the prompt. A second click on a tile executes rather than typing
+    it out, and a refused move keeps the selection so the next click can just
+    be a better one.
+    """
+    board = world["board"]
+    spot = board.tile_at(pos)
+    if spot is None:
+        return False
+
+    mine = game.my_unit_at(db, *spot, game.active_civ(db, session))
+    if mine:
+        select(db, session, view, mine)
+        return True
+    if view.selected is None:
+        return False
+    return act_on(db, session, view, world, *spot)
+
+
+def act_on(db, session, view, world, x, y):
+    """Send the selected unit at (x, y): a fight if someone is there, a walk if
+    not. Which of the two is the only thing decided here; whether it is allowed
+    is the database's business."""
+    if view.selected is None:
+        return False
+    foe = occupant(world, x, y)
+    enemy = foe is not None and foe["civ_id"] != world["snap"]["civ_id"]
+    try_it(view, (lambda: game.attack(db, view.selected, x, y)) if enemy else
+                 (lambda: game.move(db, view.selected, x, y)))
+
+    # Whether it worked or not, where the unit can go has changed -- it spent
+    # movement, or it is standing somewhere new, or it is dead.
+    if standing(world, view.selected) is not None:
+        try_it_quietly(db, session, view)
+    return True
+
+
+def try_it_quietly(db, session, view):
+    """Re-light the reachable set, keeping any refusal already on screen."""
+    said = view.trouble
+    try:
+        game.highlight_reachable(db, session, view.selected)
+    except psycopg.Error:
+        deselect(session, view)                # the unit died in the attempt
+    view.trouble = said
 
 
 def drag(db, session, view, rel):
@@ -609,15 +795,17 @@ def drag(db, session, view, rel):
 
 
 def maybe_centre(db, session, view, board, pos):
-    """Double-click to centre. A single left click is the selection gesture and
-    does nothing yet."""
-    now = time.monotonic()
-    was_at, when = view.last_click[1], view.last_click[0]
-    view.last_click = (now, pos)
-    if was_at is None or now - when > DOUBLE_CLICK:
-        return False
+    """Double-click a tile to centre the view on it.
+
+    Both clicks have to land on the same tile. Without that, picking a unit and
+    then clicking a square next to it inside a third of a second reads as a
+    double-click and moves the camera instead of the unit -- which is exactly
+    how fast anyone actually plays.
+    """
+    when, was = view.last_click
     spot = board.tile_at(pos)
-    if spot is None:
+    view.last_click = (time.monotonic(), spot)
+    if spot is None or was != spot or time.monotonic() - when > DOUBLE_CLICK:
         return False
     game.look_at(session, *spot)
     return True
@@ -648,12 +836,13 @@ def main():
         stale = False
         for event in pygame.event.get():
             # One catch, around the whole handler rather than around each
-            # action. A refused click has to leave the window standing.
+            # action, so that no click can take the window down mid-lecture.
+            # Actions already keep their own refusals; this is the backstop.
             try:
                 running, dirty = handle(event, db, session, view, world)
             except psycopg.Error as exc:
-                session.log.append(str(exc).strip())
-                running, dirty = True, False
+                view.trouble = str(exc).strip().splitlines()[0]
+                running, dirty = True, True
             stale = stale or dirty
             if not running:
                 break
@@ -667,6 +856,7 @@ def main():
                 named = world["snap"]["civ"]["name"]
                 pygame.display.set_caption(f"civ -- {named}")
 
+        view.ants = (view.ants + 1) % 1000     # one pixel a frame, forever
         draw(surface, world, session, view, legend)
         pygame.display.flip()
         clock.tick(60)

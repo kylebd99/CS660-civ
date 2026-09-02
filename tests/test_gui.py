@@ -427,3 +427,236 @@ def test_the_frame_costs_the_same_number_of_statements_on_a_bigger_world(rome):
     # of a 30x16 map, and being clipped is the cheaper case, not the invariant.
     x0, x1, y0, y1 = big["board"].window
     assert len(big["cells"]) == (x1 - x0 + 1) * (y1 - y0 + 1) < 500
+
+
+# --------------------------------------------------------------- playing it
+# The plan's bar for this phase is playing a whole turn from the window, so
+# these drive the real event handlers rather than the functions under them.
+
+def click_on(db, session, view, world, board, spot, button=1):
+    """Click the middle of a tile, as a person would."""
+    return gui.handle(event(pygame.MOUSEBUTTONDOWN, button=button,
+                            pos=board.rect_of(*spot).center),
+                      db, session, view, world)
+
+
+def test_clicking_your_own_unit_selects_it_and_lights_up_where_it_can_go(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    _, stale = click_on(db, session, view, world, world["board"], (7, 6))
+    assert stale is True
+    assert view.selected == 2
+    assert session.highlight[(8, 6)] == 1              # cost, not just a tile
+    assert session.log[-1] == "SELECT x, y, cost FROM reachable(2)"
+
+
+def test_clicking_a_square_moves_the_selected_unit(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+
+    click_on(db, session, view, world, board, (7, 6))
+    click_on(db, session, view, world, board, (8, 6))
+    assert view.trouble == ""
+    assert core.my_unit_at(db, 8, 6, 1) == 2
+    assert "move_unit(2, 8, 6)" in " ".join(session.log)
+    # Still selected, and the reachable set has shrunk with the movement spent.
+    assert view.selected == 2
+    assert max(session.highlight.values()) == 1
+
+
+def test_a_refused_move_is_shown_and_keeps_the_selection(rome):
+    """unit_one_per_tile rejecting a move is a lecture beat, not an error to be
+    smoothed over -- and the client never pre-empts it."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+
+    click_on(db, session, view, world, board, (7, 6))
+    click_on(db, session, view, world, board, (7, 7))   # ocean, and 1 mp away
+    assert "cannot reach" in view.trouble
+    assert view.selected == 2
+    assert session.highlight                            # still lit, to retry
+    assert core.my_unit_at(db, 7, 6, 1) == 2            # and it did not move
+
+
+def test_clicking_off_the_map_does_nothing(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+
+    _, stale = gui.handle(event(pygame.MOUSEBUTTONDOWN, button=1,
+                                pos=world["bands"].rail.center),
+                          db, session, view, world)
+    assert stale is False
+    assert view.selected == 2                           # nothing was dropped
+
+
+def test_arrows_step_the_selected_unit_and_pan_when_nothing_is(rome):
+    """One keypress, one visible move_unit, which is what makes it good for
+    narrating a move to a room."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    core.look_at(session, 7, 6)
+
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_RIGHT), db, session, view, world)
+    assert session.view == (8, 6)                       # panned, nothing picked
+
+    click_on(db, session, view, world, world["board"], (7, 6))
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_RIGHT), db, session, view, world)
+    assert core.my_unit_at(db, 8, 6, 1) == 2
+    assert session.view == (8, 6)                       # the camera stayed put
+
+
+def test_clicking_an_enemy_attacks_it(rome):
+    db, session = rome
+    view = gui.View()
+    # Stand their warrior next to ours; marching it eleven tiles is move_unit's
+    # test, not this one.
+    db.rows("""UPDATE unit SET tile_id = (SELECT tile_id FROM tile
+                                          WHERE x = 8 AND y = 6)
+               WHERE unit_id = 4""")
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+
+    click_on(db, session, view, world, board, (7, 6))
+    click_on(db, session, view, world, board, (8, 6))
+    assert view.trouble == ""
+    assert "attack(2, 8, 6)" in " ".join(session.log)
+    assert "move_unit" not in " ".join(session.log)
+    # It was a fight, so their warrior took damage and ours stayed put.
+    assert db.one("SELECT hp FROM unit WHERE unit_id = 4")["hp"] < 20
+    assert core.my_unit_at(db, 7, 6, 1) == 2
+
+
+def test_attacking_something_out_of_reach_is_refused_not_prevented(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+
+    click_on(db, session, view, world, board, (7, 6))
+    view.hover = (19, 9)                                # their warrior, far off
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_a), db, session, view, world)
+    assert "is not next to" in view.trouble
+
+
+def test_c_founds_a_city_with_a_settler(game, dsn):
+    session = core.Session()
+    db = dbapi.DB(dsn=dsn, echo=session.log.append)
+    core.use_civ(db, session, 1)
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    click_on(db, session, view, world, world["board"], (8, 7))   # the settler
+    assert view.selected == 1
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_c), db, session, view, world)
+    assert view.trouble == ""
+    assert core.snapshot(db, session)["my_cities"]
+
+
+def test_c_with_a_warrior_says_what_is_wrong_with_that(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_c), db, session, view, world)
+    assert "cannot found cities" in view.trouble
+
+
+def test_space_ends_the_turn(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_SPACE), db, session, view, world)
+    assert core.snapshot(db, session)["world"]["turn"] == 2
+    assert "end_turn()" in " ".join(session.log)
+
+
+def test_escape_drops_the_selection_before_it_quits(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+
+    escape = event(pygame.KEYDOWN, key=pygame.K_ESCAPE)
+    assert gui.handle(escape, db, session, view, world)[0] is True
+    assert view.selected is None and session.highlight == {}
+    # Only now does it start arming the quit.
+    assert gui.handle(escape, db, session, view, world)[0] is True
+    assert gui.handle(escape, db, session, view, world)[0] is False
+
+
+def test_selecting_someone_elses_unit_selects_nothing(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    _, stale = click_on(db, session, view, world, world["board"], (19, 9))
+    assert view.selected is None and stale is False
+
+
+def test_the_selection_and_the_costs_are_drawn(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+    click_on(db, session, view, world, board, (7, 6))
+
+    plain = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(plain, world, session, view, {})
+    view.selected = None
+    core.clear_highlight(session)
+    bare = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(bare, world, session, view, {})
+
+    rect = board.rect_of(7, 6)
+    assert pygame.image.tobytes(plain.subsurface(rect), "RGB") != \
+        pygame.image.tobytes(bare.subsurface(rect), "RGB")
+
+
+def test_a_refusal_is_drawn_in_the_context_strip(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    view.trouble = "unit 2 cannot reach (7, 7) this turn"
+    surface = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(surface, world, session, view, {})
+
+    strip = world["bands"].context
+    pixels = {surface.get_at((x, y))[:3]
+              for x in range(strip.left, strip.right, 3)
+              for y in range(strip.top, strip.top + 40)}
+    assert gui.ALARM in pixels
+
+
+def test_double_clicking_one_tile_centres_on_it(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+
+    click_on(db, session, view, world, board, (12, 3))
+    click_on(db, session, view, world, board, (12, 3))
+    assert session.view == (12, 3)
+
+
+def test_two_quick_clicks_on_different_tiles_are_two_clicks(rome):
+    """Picking a unit and then clicking the square next to it takes far less
+    than a third of a second, so proximity is what separates a double-click
+    from a move -- not timing alone."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    board = world["board"]
+    core.look_at(session, 7, 6)
+
+    click_on(db, session, view, world, board, (7, 6))
+    click_on(db, session, view, world, board, (8, 6))
+    assert session.view == (7, 6)                  # the camera did not move
+    assert core.my_unit_at(db, 8, 6, 1) == 2       # the unit did

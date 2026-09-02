@@ -226,10 +226,12 @@ def test_tiles_in_returns_values_and_a_scale_under_an_overlay(world):
     assert all(0.0 <= cell["intensity"] < 1.0 for cell in cells)
 
 
-def test_reachable_is_a_set_of_tiles(rome):
+def test_reachable_says_what_each_tile_would_cost(rome):
     db, session = rome
-    spots = core.reachable(db, WARRIOR)                       # warrior, 2 mp
-    assert (7, 6) in spots                              # where it already is
+    spots = core.reachable(db, WARRIOR)            # 2 mp
+    assert spots[(7, 6)] == 0                      # where it already is
+    assert spots[(8, 6)] == 1                      # one step onto grass
+    assert max(spots.values()) == 2                # and no further than 2
     assert all(isinstance(spot, tuple) for spot in spots)
 
 
@@ -358,7 +360,7 @@ def test_asking_where_a_unit_can_go_shows_the_recursive_query(rome):
     # go past, even though the WITH RECURSIVE itself lives in 04_views.sql.
     assert session.log[-1] == "SELECT x, y, cost FROM reachable(2)"
     core.clear_highlight(session)
-    assert session.highlight == set()
+    assert session.highlight == {}
 
 
 # ---------------------------------------------------------------- overlays
