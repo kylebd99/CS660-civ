@@ -301,7 +301,7 @@ def run_interactive(db, session, ui):
                 elif press:
                     click(db, session, ui, line, *press)
                 else:
-                    done = im.edit_line(line, key, ui["history"])
+                    done = im.edit_line(line, im.named(key), ui["history"])
                     if done:
                         if ui["history"][-1:] != [done]:
                             ui["history"].append(done)

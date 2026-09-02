@@ -40,6 +40,16 @@ class DB:
         self.echo(self.rendered(sql, params))
         return self.one(sql, params)
 
+    def in_transaction(self):
+        """Whether this connection is inside a transaction.
+
+        The connection is opened with autocommit on, so this is only ever true
+        because someone typed BEGIN. Worth showing: without it a typed BEGIN
+        silently changes the connection's state with nothing on screen, and for
+        the concurrency lectures that is a defect in the teaching.
+        """
+        return self.conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE
+
     def rendered(self, sql, params=()):
         """The statement with its parameters filled in, for display only.
         psycopg still sends the query and the parameters separately."""

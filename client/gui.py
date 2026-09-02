@@ -20,6 +20,7 @@ import psycopg
 import pygame
 
 import game
+import input_management as im     # for edit_line alone: one line editor, both
 import palette
 import render                      # for HEAT alone: one ramp, both front-ends
 from db import DB
@@ -227,6 +228,10 @@ class View:
     ants: int = 0                              # marching-ants phase, in pixels
     tray: str | None = None                    # which list is open, if any
     placing: str | None = None                 # a bought unit, awaiting a tile
+    line: dict = field(default_factory=lambda: {"text": "", "at": None,
+                                                "draft": ""})
+    history: list = field(default_factory=list)   # typed lines only, not clicks
+    result: list | None = None                 # rows a typed statement returned
     newgame: dict = field(default_factory=      # what the New game tray holds
                           lambda: {"width": 40, "height": 24,
                                    "civs": 2, "seed": 42})
@@ -603,18 +608,136 @@ def wrap(statement, width, size):
 
 
 KEYS_HELP = ("click a unit then a square to move   arrows step it   "
-             "A attack   C found   S reachable   Space ends the turn   "
-             "drag pans   Home follows   +/- zoom   Esc Esc quits")
+             "shift+B buy   shift+T research   shift+C found   "
+             "space ends the turn   drag pans   Home follows   +/- zoom   "
+             "type SQL or a command and press enter   Esc Esc quits")
 
 
-def draw_prompt(surface, rect, ui):
-    """A placeholder until there is something to type into it."""
+def reading(text):
+    """How a typed line will be taken: "command", "SQL", or None if empty.
+
+    One letter, alone or followed by a space, is a command -- the same letters
+    the terminal uses, so notes and muscle memory survive. Anything else is
+    SQL. Shown live beside the prompt, because guessing wrong about which of
+    the two you are typing is the only way this bar can surprise you.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped[0] in TYPED and (len(stripped) == 1 or stripped[1] == " "):
+        return "command"
+    return "SQL"
+
+
+def draw_prompt(surface, rect, view, db, ui):
+    """The prompt, its sigil, and what it thinks you are typing.
+
+    The sigil is the transaction state, straight off the connection: `>` when
+    autocommit is doing its usual thing, an amber `BEGIN>` once a typed BEGIN
+    has opened a transaction. Lecture 21 is about the second one.
+    """
     if not rect.height:
         return
     surface.fill(PANEL, rect)
     pygame.draw.line(surface, EDGE, rect.topleft, rect.topright)
-    write(surface, KEYS_HELP, (rect.left + round(16 * ui), rect.centery),
-          size=round(19 * ui), colour=FAINT, anchor="midleft")
+
+    pad = round(16 * ui)
+    size = round(21 * ui)
+    inside = db is not None and db.in_transaction()
+    sigil = "BEGIN>" if inside else ">"
+    at = write(surface, sigil, (rect.left + pad, rect.centery), size=size,
+               colour=AMBER if inside else MUTED, bold=inside, anchor="midleft")
+
+    if not view.line["text"]:
+        write(surface, KEYS_HELP, (at.right + pad, rect.centery),
+              size=round(18 * ui), colour=FAINT, anchor="midleft")
+        return
+
+    # Shift+Enter puts a newline in, for BEGIN; ... COMMIT; as one submission.
+    # Only the last two lines are shown; the bar is one band tall, not a pane.
+    lines = view.line["text"].split("\n")[-2:]
+    for index, text in enumerate(lines):
+        write(surface, text + ("_" if index == len(lines) - 1 else ""),
+              (at.right + pad, rect.centery
+               + round((index - (len(lines) - 1) / 2) * size)),
+              size=size, anchor="midleft")
+
+    tag = reading(view.line["text"])
+    write(surface, tag, (rect.right - pad, rect.centery), size=round(18 * ui),
+          colour=ACCENT if tag == "SQL" else MUTED, bold=True, anchor="midright")
+
+
+def draw_result(surface, bands, view):
+    """The rows a typed statement returned, over the map.
+
+    Columns are measured rather than padded, because the window's font is not
+    monospaced -- the same job render.format_rows does with str.ljust, done in
+    pixels. EXPLAIN comes back as one text column and is left exactly as
+    PostgreSQL indented it: the plan tree is the artifact.
+    """
+    if view.result is None:
+        return {}
+    ui = bands.ui
+    pad = round(14 * ui)
+    size = round(19 * ui)
+    rows = view.result
+
+    # As tall as it needs to be and no taller. A two-row answer in a panel
+    # sized for twenty reads as an error.
+    chrome = round(52 * ui) + (0 if not rows else 2 * size)
+    wanted = chrome + size * max(1, len(rows))
+    panel = pygame.Rect(0, 0, bands.map.width - round(48 * ui),
+                        min(wanted, bands.map.height - round(32 * ui)))
+    panel.midbottom = (bands.map.centerx, bands.map.bottom - round(16 * ui))
+    pygame.draw.rect(surface, PANEL, panel, border_radius=round(8 * ui))
+    pygame.draw.rect(surface, ACCENT, panel, 1, border_radius=round(8 * ui))
+    close = pygame.Rect(panel.right - round(34 * ui), panel.top + round(8 * ui),
+                        round(26 * ui), round(26 * ui))
+    write(surface, "Esc", close.center, size=round(17 * ui), colour=FAINT,
+          anchor="center")
+
+    if not rows:
+        write(surface, "(no rows)", (panel.left + pad, panel.top + pad),
+              size=size, colour=MUTED)
+        return {"result_close": close}
+
+    columns = list(rows[0])
+    plan = columns == ["QUERY PLAN"]
+    line = panel.top + pad
+    step = size
+
+    if not plan:
+        widths = [max(font(size, True).size(name)[0],
+                      *(font(size).size(str(row[name]))[0] for row in rows[:60]))
+                  + round(18 * ui) for name in columns]
+        at = panel.left + pad
+        for name, width in zip(columns, widths):
+            write(surface, name, (at, line), size=size, colour=MUTED, bold=True)
+            at += width
+        line += step
+        pygame.draw.line(surface, EDGE, (panel.left + pad, line),
+                         (panel.right - pad, line))
+        line += round(6 * ui)
+
+    shown = 0
+    for row in rows:
+        if line + step > panel.bottom - round(32 * ui):
+            break
+        if plan:
+            # No ljust and no strip: the indentation is the tree.
+            write(surface, row["QUERY PLAN"], (panel.left + pad, line),
+                  size=size)
+        else:
+            at = panel.left + pad
+            for name, width in zip(columns, widths):
+                write(surface, row[name], (at, line), size=size)
+                at += width
+        line, shown = line + step, shown + 1
+
+    write(surface, f"{shown} of {len(rows)} row{'' if len(rows) == 1 else 's'}",
+          (panel.left + pad, panel.bottom - round(20 * ui)), size=round(17 * ui),
+          colour=MUTED, anchor="midleft")
+    return {"result_close": close}
 
 
 # ------------------------------------------------------------------- chrome
@@ -861,7 +984,7 @@ def draw_ghost(surface, board, view, world):
               size=round(px * 0.34), colour=INK, anchor="midbottom")
 
 
-def draw(surface, world, session, view, legend=None):
+def draw(surface, world, session, view, legend=None, db=None):
     """One frame, from the rows the last poll fetched."""
     bands = world["bands"]
     legend = legend or {}
@@ -870,9 +993,13 @@ def draw(surface, world, session, view, legend=None):
     if world["snap"] is None:
         write(surface, "No world yet.", surface.get_rect().center,
               size=round(40 * bands.ui), bold=True, anchor="midbottom")
-        write(surface, "Deal one with `make reset`, or `n` in the terminal "
-                       "client.", surface.get_rect().center,
-              size=round(22 * bands.ui), colour=MUTED, anchor="midtop")
+        write(surface, "Press shift+N to deal one, or type `n 40 24 2 42`.",
+              surface.get_rect().center, size=round(22 * bands.ui),
+              colour=MUTED, anchor="midtop")
+        # The prompt and the New game tray still work: both are the way out of
+        # this state, so neither can be behind the world existing.
+        draw_prompt(surface, bands.prompt, view, db, bands.ui)
+        draw_tray(surface, bands, view, world)
         return
 
     draw_board(surface, world["board"], world, session, view)
@@ -883,8 +1010,9 @@ def draw(surface, world, session, view, legend=None):
     draw_context(surface, bands.context, world["snap"], view, world, legend,
                  bands.ui)
     draw_rail(surface, bands.rail, session.log, bands.ui)
-    draw_prompt(surface, bands.prompt, bands.ui)
+    draw_prompt(surface, bands.prompt, view, db, bands.ui)
     draw_ghost(surface, world["board"], view, world)
+    draw_result(surface, bands, view)
     draw_tray(surface, bands, view, world)
 
 
@@ -946,8 +1074,127 @@ def handle(event, db, session, view, world):
     return True, False
 
 
+# The terminal's one-letter commands, so that lecture notes and muscle memory
+# survive the move to a window. Deliberately not shared with civ.py's COMMANDS:
+# a shared table would have to hand back front-end-neutral results, and the
+# terminal would lose its greyed shop rows and its colour-coded civ names to
+# get there. Parsing is the cheap half to duplicate.
+
+def typed_overlay(session, args):
+    session.overlay = game.OVERLAYS.get(args[0].lower()) if args else None
+
+
+TYPED = {
+    "n": lambda db, s, v, a: game.new_game(db, s, *(int(n) for n in a[:4])),
+    "m": lambda db, s, v, a: game.move(db, int(a[0]), int(a[1]), int(a[2])),
+    "a": lambda db, s, v, a: game.attack(db, int(a[0]), int(a[1]), int(a[2])),
+    "b": lambda db, s, v, a: (game.buy(db, a[0], int(a[1]), int(a[2]))
+                              if a else open_tray(v, "buy")),
+    "c": lambda db, s, v, a: game.found_city(db, int(a[0]),
+                                             " ".join(a[1:]) or "New City"),
+    "t": lambda db, s, v, a: (game.set_research(db, a[0]) if a
+                              else open_tray(v, "research")),
+    "s": lambda db, s, v, a: select(db, s, v, int(a[0])),
+    "e": lambda db, s, v, a: game.end_turn(db),
+    "p": lambda db, s, v, a: (game.use_civ(db, s, int(a[0])) if a
+                              else open_tray(v, "civs")),
+    "v": lambda db, s, v, a: game.look_at(s, *(int(n) for n in a[:2])),
+    "y": lambda db, s, v, a: typed_overlay(s, a),
+    "?": lambda db, s, v, a: open_tray(v, "help"),
+}
+
+
+def open_tray(view, which):
+    view.tray = None if view.tray == which else which
+    view.placing = None
+
+
+def submit(db, session, view, world, force_sql=False):
+    """Run whatever is in the prompt.
+
+    Clicks do not come through here and do not enter the history: re-running a
+    statement to watch its result change is the teaching loop, and a history
+    full of moves would bury the statements worth re-running.
+    """
+    text = im.edit_line(view.line, "enter", view.history)
+    if not text:
+        return False
+    if view.history[-1:] != [text]:
+        view.history.append(text)
+
+    view.result = None
+    if not force_sql and reading(text) == "command":
+        verb, args = text[0], text[1:].split()
+        return try_it(view, lambda: TYPED[verb](db, session, view, args))
+    return try_it(view, lambda: keep_result(db, session, view, text))
+
+
+def keep_result(db, session, view, sql):
+    """Send typed SQL and hold on to whatever came back.
+
+    Always logged, unlike the reads behind a redraw: a statement you typed is
+    one you are watching.
+    """
+    view.result = game.run_sql(db, session, sql)
+
+
+# Shift and a letter is a shortcut whichever way the prompt is; a bare letter
+# is a character you can type. That is what lets shift+B open the shop while
+# `b` still starts the command the terminal uses for the same thing.
+SHORTCUT_TRAYS = {pygame.K_b: "buy", pygame.K_t: "research",
+                  pygame.K_p: "civs", pygame.K_n: "new"}
+
+
 def key_down(event, db, session, view, world):
-    if event.key in PAN_KEYS:
+    """One keypress.
+
+    The prompt is always focused, so what a key does depends on whether there
+    is anything in it: an empty prompt means the keyboard is driving the game,
+    and text in the prompt means it is driving the text. Function keys and
+    shift+letter shortcuts work either way.
+    """
+    shift = event.mod & pygame.KMOD_SHIFT
+    ctrl = event.mod & pygame.KMOD_CTRL
+    typing = bool(view.line["text"])
+
+    if event.key in (pygame.K_F11, pygame.K_F12):
+        wanted = "log" if event.key == pygame.K_F11 else "map"
+        view.focus = "both" if view.focus == wanted else wanted
+        return True, True
+    if event.key == pygame.K_F1:
+        open_tray(view, "help")
+        return True, True
+
+    if shift and event.key in SHORTCUT_TRAYS:
+        open_tray(view, SHORTCUT_TRAYS[event.key])
+        return True, True
+    if shift and event.key == pygame.K_c and view.selected is not None:
+        return True, try_it(view, lambda: game.found_city(db, view.selected))
+    if shift and event.key == pygame.K_s and view.selected is not None:
+        return True, try_it(view,
+                            lambda: game.highlight_reachable(db, session,
+                                                             view.selected))
+    if shift and event.key == pygame.K_a and view.selected is not None \
+            and view.hover:
+        return True, act_on(db, session, view, world, *view.hover)
+
+    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+        if shift:
+            # Room for BEGIN; ... COMMIT; as one submission.
+            view.line["text"] += "\n"
+            return True, False
+        return True, submit(db, session, view, world, force_sql=bool(ctrl))
+
+    if event.key == pygame.K_BACKSPACE:
+        im.edit_line(view.line, "backspace", view.history)
+        return True, False
+
+    if typing and event.key in (pygame.K_UP, pygame.K_DOWN):
+        im.edit_line(view.line, "up" if event.key == pygame.K_UP else "down",
+                     view.history)
+        return True, False
+
+    if event.key in PAN_KEYS and not typing:
         # Arrows step the selected unit, and pan when nothing is selected. One
         # keypress, one visible move_unit: the best way to narrate a move.
         if view.selected is not None and standing(world, view.selected):
@@ -957,23 +1204,26 @@ def key_down(event, db, session, view, world):
                                   y + PAN_KEYS[event.key][1]))
         game.pan(db, session, *PAN_KEYS[event.key])
         return True, True
-    if event.key in ZOOM_KEYS:
+    if event.key in PAN_KEYS:
+        return True, False                     # left and right, while typing
+    if event.key in ZOOM_KEYS and not typing:
+        # `+` and `-` are printable, so they only zoom while the prompt is
+        # empty. A statement rarely starts with either.
         view.zoom(ZOOM_KEYS[event.key])
         return True, True
-    if event.key == pygame.K_HOME:
+    if event.key == pygame.K_HOME and not typing:
         game.look_at(session)                  # back to following your pieces
-        return True, True
-    if event.key in (pygame.K_F11, pygame.K_F12):
-        wanted = "log" if event.key == pygame.K_F11 else "map"
-        view.focus = "both" if view.focus == wanted else wanted
         return True, True
     if event.key == pygame.K_ESCAPE:
         # Escape drops the selection first, and only quits when there is
         # nothing left to drop -- twice, deliberately, and there is no quit
         # button. An accidental exit in front of a lecture hall is
         # unrecoverable theatre.
-        if view.tray is not None or view.placing:
-            view.tray, view.placing = None, None
+        if view.tray is not None or view.placing or view.result is not None:
+            view.tray, view.placing, view.result = None, None, None
+            return True, False
+        if typing:
+            view.line["text"], view.line["at"] = "", None
             return True, False
         if view.selected is not None or view.trouble:
             deselect(session, view)
@@ -985,29 +1235,13 @@ def key_down(event, db, session, view, world):
 
     view.escape_armed = False
 
-    for key, tray in ((pygame.K_b, "buy"), (pygame.K_t, "research"),
-                      (pygame.K_p, "civs"), (pygame.K_QUESTION, "help"),
-                      (pygame.K_n, "new")):
-        if event.key == key:
-            view.tray = None if view.tray == tray else tray
-            view.placing = None
-            return True, True
-
-    if event.key == pygame.K_SPACE:
-        view.trouble = ""
+    if event.key == pygame.K_SPACE and not typing:
         deselect(session, view)
-        game.end_turn(db)
-        return True, True
-    if event.key == pygame.K_s and view.selected is not None:
-        # The selection already shows this; the key is kept so that the
-        # recursive query can be sent on its own and watched.
-        view.trouble = ""
-        game.highlight_reachable(db, session, view.selected)
-        return True, True
-    if event.key == pygame.K_c and view.selected is not None:
-        return True, try_it(view, lambda: game.found_city(db, view.selected))
-    if event.key == pygame.K_a and view.selected is not None and view.hover:
-        return True, act_on(db, session, view, world, *view.hover)
+        return True, try_it(view, lambda: game.end_turn(db))
+
+    if event.unicode and event.unicode.isprintable():
+        im.edit_line(view.line, event.unicode, view.history)
+        return True, False
     return True, False
 
 
@@ -1046,6 +1280,10 @@ def try_it(view, action):
         action()
     except psycopg.Error as exc:
         view.trouble = str(exc).strip().splitlines()[0]
+    except (ValueError, IndexError, KeyError) as exc:
+        # A typed command with arguments it cannot use. Not the database's
+        # doing, and not worth a traceback across a projector either.
+        view.trouble = f"cannot read that: {exc}"
     return True
 
 
@@ -1271,7 +1509,7 @@ def main():
                 pygame.display.set_caption(f"civ -- {named}")
 
         view.ants = (view.ants + 1) % 1000     # one pixel a frame, forever
-        draw(surface, world, session, view, legend)
+        draw(surface, world, session, view, legend, db)
         pygame.display.flip()
         clock.tick(60)
 

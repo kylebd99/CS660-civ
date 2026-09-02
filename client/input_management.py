@@ -70,31 +70,54 @@ def parse_keys(data):
         i += 1
 
 
+# Keystrokes that mean something other than themselves. edit_line takes these
+# names rather than terminal escape sequences, which is what lets the same
+# twenty-eight lines of line editing serve a terminal and a window: each
+# front-end translates its own keyboard into these four words and printable
+# text, and neither has to know about the other's.
+KEY_NAMES = {"\r": "enter", "\n": "enter",
+             "\x7f": "backspace", "\b": "backspace",
+             "\x1b[A": "up", "\x1b[B": "down"}
+
+EDIT_KEYS = ("enter", "up", "down", "backspace")
+
+
+def named(key):
+    """The semantic name of a keystroke, or the keystroke itself.
+
+    Anything unnamed falls through unchanged: printable text is used as-is, and
+    the escape sequences edit_line does not care about arrive as strings that
+    are not printable and are therefore ignored.
+    """
+    return KEY_NAMES.get(key, key)
+
+
 def edit_line(line, key, history):
     """Apply one keystroke to the input line.
 
-    `line` is a dict of {text, at, draft}. Returns the finished command when
-    Enter is pressed, otherwise None. Up and Down walk the history the way a
-    shell does: whatever you were part-way through typing is kept as `draft`
-    and comes back when you walk past the newest entry.
+    `line` is a dict of {text, at, draft} and `key` is one of EDIT_KEYS or a
+    printable string. Returns the finished command when Enter is pressed,
+    otherwise None. Up and Down walk the history the way a shell does: whatever
+    you were part-way through typing is kept as `draft` and comes back when you
+    walk past the newest entry.
     """
-    if key in ("\r", "\n"):
+    if key == "enter":
         done, line["text"], line["at"] = line["text"].strip(), "", None
         return done
-    if key == "\x1b[A":
+    if key == "up":
         if history:
             if line["at"] is None:
                 line["draft"], line["at"] = line["text"], len(history)
             line["at"] = max(0, line["at"] - 1)
             line["text"] = history[line["at"]]
-    elif key == "\x1b[B":
+    elif key == "down":
         if line["at"] is not None:
             line["at"] += 1
             if line["at"] >= len(history):
                 line["at"], line["text"] = None, line["draft"]
             else:
                 line["text"] = history[line["at"]]
-    elif key in ("\x7f", "\b"):
+    elif key == "backspace":
         line["text"] = line["text"][:-1]
     elif key.isprintable():
         line["text"] += key

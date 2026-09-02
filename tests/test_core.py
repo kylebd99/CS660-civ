@@ -318,16 +318,16 @@ def test_end_turn_advances_the_world(rome):
 # whose. Worth showing in the concurrency lecture.
 
 def test_one_session_cannot_move_the_others_units(game, dsn):
-    rome, egypt = core.Session(), core.Session()
+    rome, carthage = core.Session(), core.Session()
     rome_db = dbapi.DB(dsn=dsn, echo=rome.log.append)
-    egypt_db = dbapi.DB(dsn=dsn, echo=egypt.log.append)
+    carthage_db = dbapi.DB(dsn=dsn, echo=carthage.log.append)
     core.use_civ(rome_db, rome, 1)
-    core.use_civ(egypt_db, egypt, 2)
+    core.use_civ(carthage_db, carthage, 2)
 
     with pytest.raises(psycopg.Error, match="unit 3 is not yours"):
         core.move(rome_db, 3, 20, 11)               # civ 2's settler
-    core.move(egypt_db, 3, 20, 11)                  # its owner may
-    assert core.my_unit_at(egypt_db, 20, 11, 2) == 3
+    core.move(carthage_db, 3, 20, 11)               # its owner may
+    assert core.my_unit_at(carthage_db, 20, 11, 2) == 3
 
 
 # ------------------------------------------------------------------ the log
