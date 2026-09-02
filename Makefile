@@ -38,7 +38,8 @@ dev-deps:
 
 # The tests start their own PostgreSQL from a pip wheel, so this works on a
 # machine with no docker and no postgres installed, and it does not disturb
-# whatever world `make reset` last dealt.
+# whatever world `make reset` last dealt. The windowed client is tested against
+# SDL's dummy driver, so no display is needed either.
 test:
 	python3 -m pytest tests/ -q
 
