@@ -660,3 +660,286 @@ def test_two_quick_clicks_on_different_tiles_are_two_clicks(rome):
     click_on(db, session, view, world, board, (8, 6))
     assert session.view == (7, 6)                  # the camera did not move
     assert core.my_unit_at(db, 8, 6, 1) == 2       # the unit did
+
+
+# ------------------------------------------------------------ chrome, trays
+# The rule these check is that a button is enabled by something the database
+# publishes -- unit_shop.unlocked, unit_type.founds_cities -- and that where
+# there is no such column, the click goes out anyway and the refusal explains.
+
+def click_at(db, session, view, world, pos):
+    return gui.handle(event(pygame.MOUSEBUTTONDOWN, button=1, pos=pos),
+                      db, session, view, world)
+
+
+def slot(world, name):
+    return gui.hud_slots(world["bands"].hud, world["bands"].ui)[name]
+
+
+def test_the_hud_buttons_and_overlay_tabs_all_have_somewhere_to_be():
+    bands = gui.layout(gui.DEFAULT_SIZE)
+    slots = gui.hud_slots(bands.hud, bands.ui)
+    assert set(slots) == {"new", "buy", "research", "civs", "help",
+                          "overlay:terrain", "overlay:food",
+                          "overlay:production", "overlay:gold"}
+    assert all(bands.hud.contains(rect) for rect in slots.values())
+    # Nothing overlaps anything else, or one button would eat another's clicks.
+    rects = list(slots.values())
+    assert not any(a.colliderect(b) for i, a in enumerate(rects)
+                   for b in rects[i + 1:])
+
+
+def test_the_overlay_tabs_switch_the_map_and_report_the_state(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    click_at(db, session, view, world, slot(world, "overlay:food").center)
+    assert session.overlay == "food"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    assert world["highest"] is not None            # the map is now a heat map
+
+    click_at(db, session, view, world, slot(world, "overlay:terrain").center)
+    assert session.overlay is None
+
+
+def test_a_hud_button_opens_its_tray_and_closes_it_again(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    click_at(db, session, view, world, slot(world, "buy").center)
+    assert view.tray == "buy"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    assert world["shop"]                            # read only while it is open
+    click_at(db, session, view, world, slot(world, "buy").center)
+    assert view.tray is None
+    assert "shop" not in gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+
+def test_the_shop_shows_locked_units_with_what_they_need(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "buy"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    _title, rows = gui.tray_contents(view, world)
+    by_code = {label: row for row in rows for label in [row[1]]}
+
+    assert by_code["warrior"][4] is True
+    # unit_shop.unlocked is the database's answer, and the note is its reason.
+    assert by_code["knight"][4] is False
+    assert by_code["knight"][3] == "needs bronze_working"
+
+
+def test_buying_hands_the_unit_to_the_cursor_and_the_map_places_it(rome):
+    """Two clicks, and the second one is the statement: buy_unit wants
+    somewhere to put the thing, and picking that somewhere is a click."""
+    db, session = rome
+    view = gui.View()
+    db.rows("UPDATE civ SET gold = 500 WHERE civ_id = 1")
+    view.tray = "buy"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    rect = gui.tray_rect(world["bands"], gui.tray_contents(view, world)[1])
+    rows = dict(gui.tray_slots(rect, gui.tray_contents(view, world)[1],
+                              world["bands"].ui))
+    click_at(db, session, view, world, rows["buy:warrior"].center)
+    assert view.placing == "warrior" and view.tray is None
+
+    # Next to Roma, which the fixture founded on the settler's tile.
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_at(db, session, view, world, world["board"].rect_of(8, 8).center)
+    assert view.trouble == ""
+    assert view.placing is None
+    assert "buy_unit('warrior', 8, 8)" in " ".join(session.log)
+    assert core.my_unit_at(db, 8, 8, 1) is not None
+
+
+def test_placing_a_unit_somewhere_illegal_is_refused_not_prevented(rome):
+    """Illegal tiles are deliberately not greyed out. buy_unit knows where a
+    unit may stand and says so in a sentence."""
+    db, session = rome
+    view = gui.View()
+    db.rows("UPDATE civ SET gold = 500 WHERE civ_id = 1")
+    view.placing = "warrior"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    # Dry land, empty, and too far from Roma -- so the refusal is about the
+    # city rather than about the sea.
+    far = db.one("""SELECT t.x, t.y FROM tile t
+                    JOIN terrain te ON te.code = t.terrain
+                    JOIN city c ON true JOIN tile ct ON ct.tile_id = c.tile_id
+                    WHERE te.passable AND distance(t.x, t.y, ct.x, ct.y) > 1
+                      AND NOT EXISTS (SELECT 1 FROM unit u
+                                      WHERE u.tile_id = t.tile_id)
+                    ORDER BY t.x, t.y LIMIT 1""")
+    click_at(db, session, view, world,
+             world["board"].rect_of(far["x"], far["y"]).center)
+    assert "not next to a city of yours" in view.trouble
+
+    # And the sea has its own answer, which is also the database's.
+    view.placing = "warrior"
+    click_at(db, session, view, world, world["board"].rect_of(7, 7).center)
+    assert "not somewhere a unit can stand" in view.trouble
+
+
+def test_the_research_tray_offers_what_available_tech_offers(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "research"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    _title, rows = gui.tray_contents(view, world)
+    assert {row[1] for row in rows} == {t["code"] for t in world["techs"]}
+    assert "agriculture" in {row[1] for row in rows}
+    # currency needs bronze_working, so the frontier does not include it yet.
+    assert "currency" not in {row[1] for row in rows}
+
+    rect = gui.tray_rect(world["bands"], rows)
+    slots = dict(gui.tray_slots(rect, rows, world["bands"].ui))
+    click_at(db, session, view, world, slots["tech:agriculture"].center)
+    assert view.tray is None
+    assert core.snapshot(db, session)["civ"]["researching"] == "agriculture"
+
+
+def test_the_civ_tray_switches_which_player_this_window_is(rome):
+    """Its set_config statement has to appear in the log: that statement *is*
+    the session-identity lecture."""
+    db, session = rome
+    view = gui.View()
+    view.tray = "civs"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    slots = dict(gui.tray_slots(gui.tray_rect(world["bands"], rows), rows,
+                                world["bands"].ui))
+
+    click_at(db, session, view, world, slots["civ:2"].center)
+    assert session.civ_id == 2
+    assert session.log[-1] == "SELECT set_config('app.civ_id', '2', false)"
+    assert db.one("SELECT current_civ() AS me")["me"] == 2
+
+
+def test_the_new_game_spinners_step_and_deal(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "new"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    slots = dict(gui.tray_slots(gui.tray_rect(world["bands"], rows), rows,
+                                world["bands"].ui))
+
+    civs = slots["field:civs"]
+    click_at(db, session, view, world, (civs.right - 8, civs.centery))
+    assert view.newgame["civs"] == 3
+    click_at(db, session, view, world, (civs.left + 8, civs.centery))
+    assert view.newgame["civs"] == 2
+    # And it cannot be stepped below one civ, which new_game refuses anyway.
+    for _ in range(5):
+        click_at(db, session, view, world, (civs.left + 8, civs.centery))
+    assert view.newgame["civs"] == 1
+
+    view.newgame.update(width=20, height=12, seed=7)
+    click_at(db, session, view, world, slots["deal"].center)
+    assert view.tray is None
+    assert "new_game(20, 12, 7, 1)" in " ".join(session.log)
+    assert core.snapshot(db, session)["world"]["width"] == 20
+
+
+def test_found_city_appears_only_for_a_unit_that_can_found_one(game, dsn):
+    """unit_type.founds_cities and an action in hand -- both already on the row
+    the map was drawn from, so this is a column read, not a rule known."""
+    session = core.Session()
+    db = dbapi.DB(dsn=dsn, echo=session.log.append)
+    core.use_civ(db, session, 1)
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    bands = world["bands"]
+
+    def buttons():
+        return set(gui.context_slots(bands.context, world["snap"], view,
+                                     bands.ui))
+
+    assert buttons() == {"end_turn"}                # nothing selected
+    view.selected = 2                               # the warrior
+    assert buttons() == {"end_turn"}
+    view.selected = 1                               # the settler
+    assert buttons() == {"end_turn", "found"}
+
+    found = gui.context_slots(bands.context, world["snap"], view,
+                              bands.ui)["found"]
+    click_at(db, session, view, world, found.center)
+    assert view.trouble == ""
+    assert core.snapshot(db, session)["my_cities"]
+
+    # Spent, so the button goes away rather than offering a refusal.
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    assert buttons() == {"end_turn"}
+
+
+def test_the_end_turn_button_ends_the_turn(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    bands = world["bands"]
+    end = gui.context_slots(bands.context, world["snap"], view, bands.ui)["end_turn"]
+
+    click_at(db, session, view, world, end.center)
+    assert core.snapshot(db, session)["world"]["turn"] == 2
+
+
+def test_clicking_the_map_through_an_open_tray_does_not_move_anything(rome):
+    """A tray is over the map, so its own rectangle has to swallow clicks."""
+    db, session = rome
+    view = gui.View()
+    view.tray = "buy"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    rect = gui.tray_rect(world["bands"], rows)
+
+    click_at(db, session, view, world, (rect.centerx, rect.bottom - 4))
+    assert view.selected is None and view.tray == "buy"
+
+
+def test_clicking_the_map_away_from_a_tray_closes_it(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "research"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_at(db, session, view, world, world["board"].rect_of(7, 6).center)
+    assert view.tray is None
+
+
+def test_escape_closes_a_tray_before_it_touches_the_selection(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+    view.tray = "buy"
+
+    gui.handle(event(pygame.KEYDOWN, key=pygame.K_ESCAPE), db, session, view, world)
+    assert view.tray is None and view.selected == 2
+
+
+@pytest.mark.parametrize("key, tray", [(pygame.K_b, "buy"),
+                                       (pygame.K_t, "research"),
+                                       (pygame.K_p, "civs"),
+                                       (pygame.K_n, "new")])
+def test_the_terminals_letters_open_the_matching_tray(key, tray, rome):
+    """The same letters the terminal uses, so lecture notes survive."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    gui.handle(event(pygame.KEYDOWN, key=key), db, session, view, world)
+    assert view.tray == tray
+
+
+def test_every_tray_draws_without_a_world_row_it_does_not_have(rome):
+    """Each tray reads its own rows, so opening one whose rows have not been
+    fetched has to draw empty rather than fall over."""
+    db, session = rome
+    view = gui.View()
+    surface = pygame.Surface(gui.DEFAULT_SIZE)
+    for tray in ("buy", "research", "civs", "new", "help"):
+        view.tray = tray
+        world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+        world.pop("shop", None), world.pop("techs", None), world.pop("civs", None)
+        gui.draw(surface, world, session, view, {})

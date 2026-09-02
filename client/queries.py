@@ -41,7 +41,8 @@ VIEW_HOME = """SELECT x, y FROM (
                ) home ORDER BY rank, x, y LIMIT 1"""
 
 UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left,
-                  u.actions_left, u.hp, ut.max_hp, t.x, t.y, c.colour
+                  u.actions_left, u.hp, ut.max_hp, ut.founds_cities,
+                  t.x, t.y, c.colour
            FROM unit u
            JOIN unit_type ut ON ut.code    = u.type
            JOIN tile      t  ON t.tile_id  = u.tile_id

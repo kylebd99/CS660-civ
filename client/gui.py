@@ -14,7 +14,7 @@ can read from the back of a lecture hall.
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import psycopg
 import pygame
@@ -34,6 +34,7 @@ PANEL = (21, 24, 30)
 EDGE = (45, 50, 60)
 ACCENT = (86, 156, 214)
 ALARM = (226, 96, 88)
+AMBER = (224, 168, 74)
 
 # How far terrain is darkened before anything is drawn on top of it. The tile
 # colours out of 03_seed.sql are chosen to be legible as one bright character
@@ -224,6 +225,11 @@ class View:
     selected: int | None = None                # a unit id, like `m 3 ` typed
     trouble: str = ""                          # the last refusal, shown as-is
     ants: int = 0                              # marching-ants phase, in pixels
+    tray: str | None = None                    # which list is open, if any
+    placing: str | None = None                 # a bought unit, awaiting a tile
+    newgame: dict = field(default_factory=      # what the New game tray holds
+                          lambda: {"width": 40, "height": 24,
+                                   "civs": 2, "seed": 42})
 
     def zoom(self, by):
         step = TILE_STEPS.index(self.tile_px) + by
@@ -251,8 +257,20 @@ def read_world(db, session, view, size):
         tile_px = min(tile_px, TILE_STEPS[0])
     board = board_for(bands.map, game.view_centre(db, session), tile_px)
     cells, highest = game.tiles_in(db, session, board.window)
-    return {"bands": bands, "snap": snap, "board": board,
-            "cells": cells, "highest": highest}
+    world = {"bands": bands, "snap": snap, "board": board,
+             "cells": cells, "highest": highest}
+
+    # A tray's rows are read while it is open and not otherwise: three more
+    # statements per frame to keep a closed menu up to date would be three
+    # statements a second spent on nothing. A unit being placed still needs
+    # the shop, for its price.
+    if view.tray == "buy" or view.placing:
+        world["shop"] = game.unit_shop(db, snap["civ_id"])
+    if view.tray == "research":
+        world["techs"] = game.available_techs(db, snap["civ_id"])
+    if view.tray == "civs":
+        world["civs"] = game.all_civs(db)
+    return world
 
 
 def tile_colours(cells, highest):
@@ -281,6 +299,16 @@ def draw_board(surface, board, world, session, view):
 
     for spot, colour in fill.items():
         surface.fill(colour, board.rect_of(*spot))
+
+    # The edge of the world. Tiles run 0..width-1, and the frame is kept the
+    # size of the viewport even when you pan off the map, so without this the
+    # emptiness beyond the last tile looks like a drawing fault rather than
+    # the end of the world.
+    edge = board.rect_of(0, world["snap"]["world"]["height"] - 1)
+    edge.width = world["snap"]["world"]["width"] * px
+    edge.height = world["snap"]["world"]["height"] * px
+    if board.area.colliderect(edge):
+        pygame.draw.rect(surface, EDGE, edge.clip(board.area), 1)
 
     # The overlay's numbers, drawn big. A heat map you can only read as colour
     # is a decoration; with the value on it you can also read it as data.
@@ -314,8 +342,15 @@ def draw_board(surface, board, world, session, view):
         pygame.draw.rect(surface, INK, rect, 2, border_radius=px // 6)
         write(surface, city["population"], rect.center, size=round(px * 0.55),
               colour=palette.readable_on(colour), bold=True, anchor="center")
-        write(surface, city["name"], (rect.centerx, rect.bottom + 2),
-              size=round(px * 0.4), colour=INK, anchor="midtop")
+        # The name sits on top of the map, and often on top of whatever is
+        # standing on the next tile down, so it gets its own backing.
+        size = round(px * 0.4)
+        pill = font(size).size(city["name"])
+        plate = pygame.Rect(0, 0, pill[0] + 6, pill[1])
+        plate.midtop = (rect.centerx, rect.bottom + 3)
+        pygame.draw.rect(surface, BACKDROP, plate, border_radius=3)
+        write(surface, city["name"], plate.center, size=size, colour=INK,
+              anchor="center")
 
     for unit in world["snap"]["units"]:
         rect = board.rect_of(unit["x"], unit["y"])
@@ -375,7 +410,7 @@ def dashed_rect(surface, colour, rect, phase, dash=7, width=3):
             surface.fill(colour, (x - width // 2, y - width // 2, width, width))
 
 
-def draw_gutter(surface, board, ui):
+def draw_gutter(surface, board, extent, ui):
     """Coordinates in a margin, ticked every five tiles.
 
     This replaces the terminal's corner captions, which had to be drawn on top
@@ -383,18 +418,22 @@ def draw_gutter(surface, board, ui):
     collision logic is gone rather than ported.
     """
     x0, x1, y0, y1 = board.window
+    width, height = extent
     size = max(11, round(15 * ui))
-    for x in range(x0 - x0 % 5, x1 + 1, 5):
+    # Only tiles the world actually has. Off the edge of the map the numbers
+    # are still meaningful, but labelling them crowds the corner with
+    # coordinates of places that do not exist.
+    for x in range(max(x0, 0) - max(x0, 0) % 5, min(x1, width - 1) + 1, 5):
         rect = board.rect_of(x, y0)
         write(surface, x, (rect.centerx, board.area.bottom + 4), size=size,
               colour=MUTED, anchor="midtop")
-    for y in range(y0 - y0 % 5, y1 + 1, 5):
+    for y in range(max(y0, 0) - max(y0, 0) % 5, min(y1, height - 1) + 1, 5):
         rect = board.rect_of(x0, y)
         write(surface, y, (board.area.left - 5, rect.centery), size=size,
               colour=MUTED, anchor="midright")
 
 
-def draw_hud(surface, rect, snap, session, ui):
+def draw_hud(surface, rect, snap, session, view, ui):
     """Turn, whose window this is, the purse, and what is being researched."""
     if not rect.height:
         return
@@ -404,26 +443,40 @@ def draw_hud(surface, rect, snap, session, ui):
     civ = snap["civ"]
     pad = round(18 * ui)
     big, small = round(30 * ui), round(21 * ui)
+    middle = rect.top + rect.height // 4
     at = write(surface, f"turn {snap['world']['turn']}",
-               (rect.left + pad, rect.centery), size=big, bold=True,
+               (rect.left + pad, middle), size=big, bold=True,
                anchor="midleft")
 
     # The civ chip is filled with civ.colour, so in a two-window demo you can
     # tell at a glance which window is Rome without reading anything.
     colour = palette.rgb(civ["colour"])
-    chip = pygame.Rect(at.right + pad, 0, round(150 * ui), round(34 * ui))
-    chip.centery = rect.centery
+    chip = pygame.Rect(at.right + pad, 0, round(150 * ui), round(28 * ui))
+    chip.centery = middle
     pygame.draw.rect(surface, colour, chip, border_radius=round(6 * ui))
     write(surface, civ["name"], chip.center, size=small,
           colour=palette.readable_on(colour), bold=True, anchor="center")
 
     at = write(surface, f"{civ['gold']}g   {civ['science']} science",
-               (chip.right + pad, rect.centery), size=small, anchor="midleft")
+               (chip.right + pad, middle), size=small, anchor="midleft")
 
     researching = civ["researching"]
-    write(surface, researching or "researching nothing",
-          (at.right + pad, rect.centery), size=small,
+    write(surface, f"researching {researching}" if researching
+          else "researching nothing", (at.right + pad, middle), size=small,
           colour=INK if researching else FAINT, anchor="midleft")
+
+    # The buttons, and the segmented overlay control on the right. `on` for
+    # the overlay comes from session.overlay, so the control reports the state
+    # rather than remembering its own.
+    showing = session.overlay or "terrain"
+    for key, slot in hud_slots(rect, ui).items():
+        if key.startswith("overlay:"):
+            which = key.removeprefix("overlay:")
+            label = dict(OVERLAY_TABS)[which]
+            button(surface, slot, label, ui, on=which == showing)
+        else:
+            button(surface, slot, dict(HUD_ACTIONS)[key], ui,
+                   on=view.tray == key)
 
 
 def draw_context(surface, rect, snap, view, world, legend, ui):
@@ -462,6 +515,24 @@ def draw_context(surface, rect, snap, view, world, legend, ui):
     line += size
 
     units = snap["my_units"]
+
+    for key, slot in context_slots(rect, snap, view, ui).items():
+        if key == "end_turn":
+            # The largest button on screen, and amber once everything you own
+            # has spent both its budgets -- the moment there is nothing left to
+            # do but pass.
+            done = all(u["moves_left"] == 0 and u["actions_left"] == 0
+                       for u in units)
+            pygame.draw.rect(surface, AMBER if done else PANEL, slot,
+                             border_radius=round(6 * ui))
+            pygame.draw.rect(surface, AMBER, slot, 2,
+                             border_radius=round(6 * ui))
+            write(surface, "END TURN", slot.center, size=round(24 * ui),
+                  colour=BACKDROP if done else AMBER, bold=True,
+                  anchor="center")
+        else:
+            button(surface, slot, "Found city", ui)
+
     if not units:
         write(surface, "no units", (rect.left + pad, line), size=size,
               colour=FAINT)
@@ -477,7 +548,7 @@ def draw_context(surface, rect, snap, view, world, legend, ui):
         drawn = write(surface, chunk, (at, line), size=size,
                       colour=FAINT if spent else colour)
         at = drawn.right + round(24 * ui)
-        if at > rect.right - round(200 * ui):        # wrap rather than run off
+        if at > rect.right - round(260 * ui):        # wrap rather than run off
             at, line = rect.left + pad, line + size
             if line > rect.bottom - size:
                 break
@@ -546,6 +617,250 @@ def draw_prompt(surface, rect, ui):
           size=round(19 * ui), colour=FAINT, anchor="midleft")
 
 
+# ------------------------------------------------------------------- chrome
+# Buttons and trays. Every clickable thing is a rect produced by one of the
+# *_slots functions below, and both drawing and hit-testing read the same
+# function -- so a button cannot end up somewhere other than where it works.
+#
+# What a button is *enabled* by always comes from something the database
+# publishes: unit_shop.unlocked, unit_type.founds_cities, available_tech. Where
+# there is no such view, the button stays enabled and the refusal does the
+# explaining.
+
+HUD_ACTIONS = (("new", "New game"), ("buy", "Buy"), ("research", "Research"),
+               ("civs", "Play as"), ("help", "?"))
+
+# The segmented overlay control. "terrain" is the absence of an overlay, and
+# the values are the ones game.OVERLAYS maps onto.
+OVERLAY_TABS = (("terrain", "Terrain"), ("food", "Food"),
+                ("production", "Prod"), ("gold", "Gold"))
+
+NEW_GAME_FIELDS = (("width", 4, 400), ("height", 4, 400),
+                   ("civs", 1, 12), ("seed", 0, 9999))
+
+
+def button(surface, rect, label, ui, *, on=False, enabled=True):
+    """One button. Filled when it is the current choice, outlined otherwise,
+    and greyed when the database says it is not available."""
+    body = ACCENT if on else PANEL
+    ink = BACKDROP if on else (INK if enabled else FAINT)
+    pygame.draw.rect(surface, body, rect, border_radius=round(5 * ui))
+    pygame.draw.rect(surface, ACCENT if on else EDGE, rect, 1,
+                     border_radius=round(5 * ui))
+    write(surface, label, rect.center, size=round(20 * ui), colour=ink,
+          bold=on, anchor="center")
+
+
+def flow(labels, left, top, height, ui, gap=None):
+    """Lay a row of buttons out left to right, each as wide as its label.
+
+    Returns [(key, rect)] in order, so a caller can draw them and a click can
+    be tested against the same rects.
+    """
+    gap = round(8 * ui) if gap is None else gap
+    size = round(20 * ui)
+    at, out = left, []
+    for key, label in labels:
+        width = font(size).size(label)[0] + round(22 * ui)
+        out.append((key, pygame.Rect(at, top, width, height)))
+        at += width + gap
+    return out
+
+
+def hud_slots(rect, ui):
+    """The HUD's clickable things: name -> rect.
+
+    The status line gets the top half and the buttons the bottom, which is why
+    the band is two rows deep. Squeezing both onto one line works at 1600px and
+    then collides the moment the window is halved for a two-player demo.
+    """
+    if not rect.height:
+        return {}
+    height = round(30 * ui)
+    top = rect.top + rect.height // 2 + (rect.height // 2 - height) // 2
+    slots = dict(flow(HUD_ACTIONS, rect.left + round(18 * ui), top, height, ui))
+
+    # The overlay tabs are pinned to the right, as one segmented control.
+    tabs = flow(OVERLAY_TABS, 0, top, height, ui, gap=0)
+    span = tabs[-1][1].right - tabs[0][1].left
+    shift = rect.right - round(18 * ui) - span
+    slots.update({f"overlay:{key}": tab.move(shift, 0) for key, tab in tabs})
+    return slots
+
+
+def context_slots(rect, snap, view, ui):
+    """The context strip's buttons.
+
+    `Found city` appears only for a unit that can actually found one, which is
+    unit_type.founds_cities and an action still in hand -- both already on the
+    row the map was drawn from. It is not a rule the client knows; it is a
+    column it can read.
+    """
+    if not rect.height:
+        return {}
+    height = round(44 * ui)
+    slots = {}
+
+    end = pygame.Rect(0, 0, round(200 * ui), height)
+    end.bottomright = (rect.right - round(18 * ui), rect.bottom - round(14 * ui))
+    slots["end_turn"] = end
+
+    picked = next((u for u in snap["my_units"]
+                   if u["unit_id"] == view.selected), None)
+    if picked and picked["founds_cities"] and picked["actions_left"] >= 1:
+        found = pygame.Rect(0, 0, round(150 * ui), height)
+        found.bottomleft = (rect.left + round(18 * ui),
+                            rect.bottom - round(14 * ui))
+        slots["found"] = found
+    return slots
+
+
+TRAY_ROW_H = 38
+
+
+def tray_rect(bands, rows=()):
+    """Where a tray sits: over the map, anchored to its bottom-left, and only
+    as tall as what is in it.
+
+    Over the map rather than over the log, because the log is the artifact
+    being taught and covering it up to show a menu would be hiding the wrong
+    thing.
+    """
+    ui = bands.ui
+    high = round((64 + TRAY_ROW_H * max(1, len(rows))) * ui)
+    rect = pygame.Rect(0, 0, round(420 * ui),
+                       min(high, bands.map.height - round(32 * ui)))
+    rect.bottomleft = (bands.map.left + round(24 * ui),
+                       bands.map.bottom - round(16 * ui))
+    return rect
+
+
+def tray_slots(rect, rows, ui):
+    """One rect per row of a tray, under its title."""
+    height = round(TRAY_ROW_H * ui)
+    top = rect.top + round(52 * ui)
+    out = []
+    for index, (key, *_rest) in enumerate(rows):
+        line = pygame.Rect(rect.left + round(12 * ui), top + index * height,
+                           rect.width - round(24 * ui), height - round(4 * ui))
+        if line.bottom > rect.bottom - round(12 * ui):
+            break
+        out.append((key, line))
+    return out
+
+
+def tray_contents(view, world):
+    """(title, rows) for the open tray, where a row is
+    (key, label, right, note, enabled, colour).
+
+    The rows are the database's own rows, reshaped. Nothing is filtered out --
+    a locked unit is shown greyed with what it needs, so the shop doubles as a
+    reason to research something.
+    """
+    if view.tray == "buy":
+        rows = [(f"buy:{u['code']}", u["code"], f"{u['cost']}g",
+                 f"{u['moves']}mp  str {u['strength']}" if u["unlocked"]
+                 else f"needs {u['required_tech']}", u["unlocked"], None)
+                for u in world.get("shop", ())]
+        return "Buy a unit", rows
+    if view.tray == "research":
+        rows = [(f"tech:{t['code']}", t["code"], str(t["cost"]), "", True, None)
+                for t in world.get("techs", ())]
+        return "Research", rows
+    if view.tray == "civs":
+        rows = [(f"civ:{c['civ_id']}", c["name"], f"#{c['civ_id']}", "", True,
+                 palette.rgb(c["colour"])) for c in world.get("civs", ())]
+        return "Play as", rows
+    if view.tray == "new":
+        rows = [(f"field:{name}", name, str(view.newgame[name]), "", True, None)
+                for name, _low, _high in NEW_GAME_FIELDS]
+        return "New game", rows + [("deal", "Deal a world", "", "", True, None)]
+    if view.tray == "help":
+        return "Keys", [(f"help:{n}", line, "", "", False, None)
+                        for n, line in enumerate(KEYS_HELP.split("   "))]
+    return None, []
+
+
+def draw_tray(surface, bands, view, world):
+    """The open tray, if any, and the ghost of a unit waiting to be placed."""
+    if view.tray is None:
+        return {}
+    ui = bands.ui
+    title, rows = tray_contents(view, world)
+    rect = tray_rect(bands, rows)
+    pygame.draw.rect(surface, PANEL, rect, border_radius=round(8 * ui))
+    pygame.draw.rect(surface, EDGE, rect, 1, border_radius=round(8 * ui))
+    write(surface, title, (rect.left + round(16 * ui), rect.top + round(16 * ui)),
+          size=round(24 * ui), bold=True)
+    write(surface, "Esc", (rect.right - round(16 * ui), rect.top + round(18 * ui)),
+          size=round(18 * ui), colour=FAINT, anchor="topright")
+
+    slots = dict(tray_slots(rect, rows, ui))
+    for key, label, right, note, enabled, colour in rows:
+        line = slots.get(key)
+        if line is None:
+            continue
+        ink = INK if enabled else FAINT
+        if key.startswith("field:") or key == "deal":
+            # A spinner, not a row: the value sits between two steppers.
+            button(surface, line, "", ui)
+            write(surface, label, (line.left + round(12 * ui), line.centery),
+                  size=round(20 * ui), colour=ink, anchor="midleft")
+            if key == "deal":
+                continue
+            write(surface, right, (line.centerx + round(40 * ui), line.centery),
+                  size=round(20 * ui), colour=INK, bold=True, anchor="center")
+            for sign, edge in (("-", line.centerx), ("+", line.right - round(30 * ui))):
+                write(surface, sign, (edge + round(15 * ui), line.centery),
+                      size=round(24 * ui), colour=ACCENT, anchor="center")
+            continue
+
+        if enabled:
+            pygame.draw.rect(surface, BACKDROP, line, border_radius=round(4 * ui))
+        if colour:
+            chip = pygame.Rect(line.left + round(8 * ui), 0, round(14 * ui),
+                               round(14 * ui))
+            chip.centery = line.centery
+            pygame.draw.rect(surface, colour, chip, border_radius=2)
+        write(surface, label, (line.left + round(30 * ui if colour else 12 * ui),
+                               line.centery), size=round(21 * ui), colour=ink,
+              anchor="midleft")
+        if right:
+            write(surface, right, (line.right - round(12 * ui), line.centery),
+                  size=round(21 * ui), colour=ink, bold=True, anchor="midright")
+        if note:
+            write(surface, note, (line.right - round(12 * ui), line.centery),
+                  size=round(17 * ui), colour=FAINT, anchor="midright") \
+                if not right else write(
+                    surface, note, (line.centerx, line.centery),
+                    size=round(17 * ui), colour=FAINT, anchor="center")
+    return slots
+
+
+def draw_ghost(surface, board, view, world):
+    """The unit a buy tray handed to the cursor, following it around.
+
+    Illegal tiles are not greyed out. buy_unit knows where a unit may stand and
+    says so in a sentence; a client that greyed them would be repeating a rule.
+    """
+    if not view.placing or view.hover is None:
+        return
+    rect = board.rect_of(*view.hover)
+    if not board.area.contains(rect):
+        return
+    px = board.tile_px
+    ghost = pygame.Surface(rect.size, pygame.SRCALPHA)
+    kind = next((u for u in world.get("shop", ())
+                 if u["code"] == view.placing), None)
+    pygame.draw.circle(ghost, (*INK, 110), (px // 2, px // 2), px * 0.36)
+    surface.blit(ghost, rect)
+    write(surface, view.placing[0], rect.center, size=round(px * 0.5),
+          colour=BACKDROP, bold=True, anchor="center")
+    if kind:
+        write(surface, f"{kind['cost']}g", (rect.centerx, rect.top - 2),
+              size=round(px * 0.34), colour=INK, anchor="midbottom")
+
+
 def draw(surface, world, session, view, legend=None):
     """One frame, from the rows the last poll fetched."""
     bands = world["bands"]
@@ -561,12 +876,16 @@ def draw(surface, world, session, view, legend=None):
         return
 
     draw_board(surface, world["board"], world, session, view)
-    draw_gutter(surface, world["board"], bands.ui)
-    draw_hud(surface, bands.hud, world["snap"], session, bands.ui)
+    draw_gutter(surface, world["board"],
+                (world["snap"]["world"]["width"],
+                 world["snap"]["world"]["height"]), bands.ui)
+    draw_hud(surface, bands.hud, world["snap"], session, view, bands.ui)
     draw_context(surface, bands.context, world["snap"], view, world, legend,
                  bands.ui)
     draw_rail(surface, bands.rail, session.log, bands.ui)
     draw_prompt(surface, bands.prompt, bands.ui)
+    draw_ghost(surface, world["board"], view, world)
+    draw_tray(surface, bands, view, world)
 
 
 # --------------------------------------------------------------------- input
@@ -614,6 +933,9 @@ def handle(event, db, session, view, world):
         if event.button in (2, 3):
             view.panning, view.drag = True, (0, 0)
         elif event.button == 1 and board is not None:
+            handled = click_chrome(db, session, view, world, event.pos)
+            if handled is not None:
+                return True, handled
             if maybe_centre(db, session, view, board, event.pos):
                 return True, True
             return True, click(db, session, view, world, event.pos)
@@ -650,6 +972,9 @@ def key_down(event, db, session, view, world):
         # nothing left to drop -- twice, deliberately, and there is no quit
         # button. An accidental exit in front of a lecture hall is
         # unrecoverable theatre.
+        if view.tray is not None or view.placing:
+            view.tray, view.placing = None, None
+            return True, False
         if view.selected is not None or view.trouble:
             deselect(session, view)
             return True, False
@@ -659,6 +984,14 @@ def key_down(event, db, session, view, world):
         return True, False
 
     view.escape_armed = False
+
+    for key, tray in ((pygame.K_b, "buy"), (pygame.K_t, "research"),
+                      (pygame.K_p, "civs"), (pygame.K_QUESTION, "help"),
+                      (pygame.K_n, "new")):
+        if event.key == key:
+            view.tray = None if view.tray == tray else tray
+            view.placing = None
+            return True, True
 
     if event.key == pygame.K_SPACE:
         view.trouble = ""
@@ -728,6 +1061,83 @@ def deselect(session, view):
     game.clear_highlight(session)
 
 
+def click_chrome(db, session, view, world, pos):
+    """Buttons and trays. Returns None if the click was not on any of them, so
+    that the caller can offer it to the map instead."""
+    bands = world["bands"]
+    was_open = view.tray
+
+    if view.tray is not None:
+        _title, rows = tray_contents(view, world)
+        rect = tray_rect(bands, rows)
+        for key, line in tray_slots(rect, rows, bands.ui):
+            if line.collidepoint(pos):
+                return tray_chosen(db, session, view, world, key, line, pos)
+        if rect.collidepoint(pos):
+            return False                   # inside the tray, but on no row
+        view.tray = None                   # clicking away closes it
+
+    for key, slot in hud_slots(bands.hud, bands.ui).items():
+        if not slot.collidepoint(pos):
+            continue
+        if key.startswith("overlay:"):
+            which = key.removeprefix("overlay:")
+            session.overlay = None if which == "terrain" else which
+        else:
+            # Against `was_open`, not view.tray: clicking away just cleared it,
+            # so comparing with the current value would close this tray and
+            # immediately reopen it.
+            view.tray = None if was_open == key else key
+            view.placing = None
+        return True
+
+    if world.get("snap"):
+        for key, slot in context_slots(bands.context, world["snap"], view,
+                                       bands.ui).items():
+            if not slot.collidepoint(pos):
+                continue
+            if key == "end_turn":
+                deselect(session, view)
+                return try_it(view, lambda: game.end_turn(db))
+            return try_it(view, lambda: game.found_city(db, view.selected))
+    return None
+
+
+def tray_chosen(db, session, view, world, key, line, pos):
+    """One row of the open tray was clicked."""
+    kind, _, value = key.partition(":")
+
+    if kind == "buy":
+        # The unit is handed to the cursor rather than bought on the spot:
+        # buy_unit wants somewhere to put it, and picking that somewhere is a
+        # click on the map. Locked units are still clickable, and buy_unit is
+        # what says no.
+        view.placing, view.tray, view.trouble = value, None, ""
+        return True
+    if kind == "tech":
+        view.tray = None
+        return try_it(view, lambda: game.set_research(db, value))
+    if kind == "civ":
+        view.tray = None
+        deselect(session, view)
+        game.use_civ(db, session, int(value))
+        return True
+    if kind == "field":
+        # Left half steps down, right half steps up.
+        low, high = next((lo, hi) for name, lo, hi in NEW_GAME_FIELDS
+                         if name == value)
+        step = -1 if pos[0] < line.centerx + line.width // 4 else 1
+        if value == "seed":
+            step *= 7                      # a seed of 43 looks like a seed of 42
+        view.newgame[value] = max(low, min(high, view.newgame[value] + step))
+        return True
+    if kind == "deal":
+        view.tray = None
+        deselect(session, view)
+        return try_it(view, lambda: game.new_game(db, session, **view.newgame))
+    return False
+
+
 def click(db, session, view, world, pos):
     """Click one of your units to pick it, then a square to send it there.
 
@@ -740,6 +1150,10 @@ def click(db, session, view, world, pos):
     spot = board.tile_at(pos)
     if spot is None:
         return False
+
+    if view.placing:
+        kind, view.placing = view.placing, None
+        return try_it(view, lambda: game.buy(db, kind, *spot))
 
     mine = game.my_unit_at(db, *spot, game.active_civ(db, session))
     if mine:
