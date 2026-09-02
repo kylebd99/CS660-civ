@@ -37,6 +37,18 @@ INSERT INTO tech_prereq (tech, requires) VALUES
   ('mathematics',      'the_wheel'),
   ('philosophy',       'writing');
 
+-- What each tech is worth on the ground. Not every tech pays out: writing and
+-- philosophy buy you other techs, and mathematics unlocks nothing at all yet.
+INSERT INTO terrain_bonus (tech, terrain, food, production, gold) VALUES
+  ('agriculture',      'grass',  1, 0, 0),
+  ('pottery',          'ocean',  1, 0, 0),
+  ('animal_husbandry', 'plains', 1, 0, 0),
+  ('mining',           'hills',  0, 2, 0),
+  ('bronze_working',   'forest', 0, 1, 0),
+  ('the_wheel',        'plains', 0, 1, 0),
+  ('currency',         'grass',  0, 0, 1),
+  ('currency',         'plains', 0, 0, 1);
+
 INSERT INTO unit_type (code, glyph, max_hp, moves, actions, strength, cost,
                        founds_cities, required_tech) VALUES
   ('settler', 's', 10, 2, 1,  0, 40, true,  NULL),   -- strength 0: cannot attack

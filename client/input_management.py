@@ -19,7 +19,7 @@ from contextlib import contextmanager
 
 # How often the screen redraws while waiting for you to type, so another
 # player's moves show up without you having to press a key.
-REFRESH_SECONDS = 0.1
+REFRESH_SECONDS = 1.0
 
 
 # Ask the terminal to report clicks, in SGR mode so columns past 223 still fit.

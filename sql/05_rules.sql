@@ -29,12 +29,21 @@ CREATE FUNCTION new_game(_width int DEFAULT 30, _height int DEFAULT 16,
                          _seed int DEFAULT 42, _civs int DEFAULT 1)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-  names   text[] := ARRAY['Rome', 'Carthage', 'Egypt', 'Persia'];
-  colours int[]  := ARRAY[203, 75, 179, 114];
+  -- Curated names come first; past the end of the list a civ gets a generated
+  -- one, so the number of players is limited by how much room the map has
+  -- rather than by the length of this array.
+  names   text[] := ARRAY['Rome', 'Carthage', 'Egypt', 'Persia',
+                          'Greece', 'Babylon', 'Nubia', 'Assyria',
+                          'Phoenicia', 'Sparta', 'Macedon', 'Gaul'];
+  -- Distinguishable ANSI colours, cycled once they run out. Two civs sharing a
+  -- colour is ugly but playable; refusing to start is not.
+  colours int[]  := ARRAY[203, 75, 179, 114, 220, 141,
+                          44, 209, 84, 170, 39, 130];
+  cols int; rows int;
   i int; cid int; home bigint; home_x int; home_y int; guard bigint;
 BEGIN
-  IF _civs < 1 OR _civs > array_length(names, 1) THEN
-    RAISE EXCEPTION 'civs must be between 1 and %', array_length(names, 1);
+  IF _civs < 1 THEN
+    RAISE EXCEPTION 'civs must be at least 1';
   END IF;
 
   -- RESTART IDENTITY matters: without it unit and city ids keep climbing across
@@ -50,18 +59,33 @@ BEGIN
   FROM generate_series(0, _width - 1) AS x,
        generate_series(0, _height - 1) AS y;
 
-  FOR i IN 1.._civs LOOP
-    INSERT INTO civ (name, colour) VALUES (names[i], colours[i]) RETURNING civ_id INTO cid;
+  -- Starting positions go on a grid rather than a line, so a large number of
+  -- civs does not queue up along the middle row. One civ still lands in the
+  -- centre and two still land at the quarter marks, as before.
+  cols := ceil(sqrt(_civs))::int;
+  rows := ceil(_civs::numeric / cols)::int;
 
-    -- Space the civs evenly across the middle of the map, then snap to the
-    -- nearest land tile nobody is standing on.
+  FOR i IN 1.._civs LOOP
+    INSERT INTO civ (name, colour)
+    VALUES (COALESCE(names[i], format('Civ %s', i)),
+            colours[1 + (i - 1) % array_length(colours, 1)])
+    RETURNING civ_id INTO cid;
+
+    -- Aim at this civ's cell of the grid, then snap to the nearest land tile
+    -- nobody is standing on.
     SELECT t.tile_id, t.x, t.y INTO home, home_x, home_y
     FROM tile t JOIN terrain te ON te.code = t.terrain
     WHERE te.passable AND NOT EXISTS (SELECT 1 FROM unit u WHERE u.tile_id = t.tile_id)
     ORDER BY distance(t.x, t.y,
-                      (_width * (2 * i - 1) / (2 * _civs))::int,
-                      (_height / 2)::int)
+                      (_width  * (2 * ((i - 1) % cols) + 1) / (2 * cols))::int,
+                      (_height * (2 * ((i - 1) / cols) + 1) / (2 * rows))::int)
     LIMIT 1;
+
+    -- With enough civs on a small or watery map the land simply runs out.
+    IF home IS NULL THEN
+      RAISE EXCEPTION 'no free land left to place % civs on a % x % map',
+        _civs, _width, _height;
+    END IF;
 
     INSERT INTO unit (civ_id, type, tile_id, hp, moves_left, actions_left)
     SELECT cid, 'settler', home, ut.max_hp, ut.moves, ut.actions
@@ -81,6 +105,13 @@ BEGIN
       FROM unit_type ut WHERE ut.code = 'warrior';
     END IF;
   END LOOP;
+
+  -- Tell the planner what it has just been handed. A freshly filled table has
+  -- no statistics at all -- pg_class.reltuples reads -1 -- so the planner
+  -- guesses, and on a large map it guesses badly: asking where a handful of
+  -- units are standing turns into a hash join over every tile in the world.
+  -- Autovacuum would get round to this eventually; a new game cannot wait.
+  ANALYZE tile, unit, city, city_tile, civ;
 END $$;
 
 -- --------------------------------------------------------------- found_city

@@ -35,6 +35,9 @@ FIRST_CIV = "SELECT min(civ_id) AS civ_id FROM civ"
 # to draw_map, so the window has one definition rather than two.
 TILES = "SELECT x, y, glyph, colour FROM map_window(%s, %s, %s, %s)"
 
+# The same window, but what each tile is worth to you rather than how it looks.
+YIELDS = "SELECT x, y, food, production, gold FROM yield_window(%s, %s, %s, %s, %s)"
+
 # Where to look when you have not said: your first city, else your first unit.
 VIEW_HOME = """SELECT x, y FROM (
                  SELECT t.x, t.y, 0 AS rank FROM city c
@@ -197,6 +200,29 @@ def cmd_sql(db, state, args):
     state["note"] = render.format_rows(rows)
 
 
+# What `y` will accept, and which column of yield_window each one colours.
+OVERLAYS = {"food": "food", "f": "food",
+            "production": "production", "prod": "production", "p": "production",
+            "gold": "gold", "g": "gold"}
+
+
+def cmd_yield(db, state, args):
+    """Colour the map by what tiles are worth instead of what they are.
+
+    `y` on its own goes back to terrain. Red is nothing, green is the best in
+    view, and the glyph is the number, so the map can be read either way.
+    """
+    if not args:
+        state["overlay"] = None
+        return
+    field = OVERLAYS.get(args[0].lower())
+    if field is None:
+        state["note"] = ("  show what? " + " ".join(sorted(set(OVERLAYS.values())))
+                         + "   (`y` alone returns to terrain)")
+        return
+    state["overlay"] = field
+
+
 def cmd_view(db, state, args):
     """Centre the view on a tile. `v` alone goes back to following your pieces,
     which is also what shift+arrow panning steps away from."""
@@ -242,6 +268,7 @@ COMMANDS = {
     "e": (cmd_end,      "e                   end the turn"),
     "p": (cmd_play_as,  "p [civ]             list civs, or play as one"),
     "v": (cmd_view,     "v [x y]             centre the view (shift+arrows pan)"),
+    "y": (cmd_yield,    "y [food|prod|gold]  colour the map by yield"),
     ":": (cmd_sql,      ": <sql>             run SQL against the live game"),
     "?": (cmd_help,     "?                   this list"),
     "q": (cmd_quit,     "q                   quit"),
@@ -268,6 +295,8 @@ def screen(db, state):
     # pieces is fog of war, which is a different question and not built yet.
     mine = lambda rows: [row for row in rows if row["civ_id"] == me]
 
+    # Built once to measure, since the overlay label changes the first line's
+    # content but never the line count, and the window needs that count.
     status = render.draw_status(world, civ, mine(cities))
 
     # Size the window to whatever is left of the terminal after the status
@@ -279,7 +308,20 @@ def screen(db, state):
     cx, cy = view_centre(db, state)
     window = (cx - wide // 2, cx + wide // 2, cy - high // 2, cy + high // 2)
 
-    tiles = db.rows(TILES, window)
+    # Terrain, or the same window recoloured by one resource. draw_map is told
+    # nothing about overlays: it is handed cells with a glyph and a colour
+    # either way, and does not care where they came from.
+    showing = None
+    if state["overlay"]:
+        rates = db.rows(YIELDS, (me, *window))
+        tiles, highest = render.heat_tiles(rates, state["overlay"])
+        showing = f"showing {state['overlay']} 0-{highest}"
+    else:
+        tiles = db.rows(TILES, window)
+
+    if showing:
+        status = render.draw_status(world, civ, mine(cities), showing)
+
     map_lines, origin = render.draw_map(tiles, units, cities, state["highlight"],
                                         window=window)
 
@@ -314,8 +356,12 @@ def tile_clicked(state, column, row):
 
 
 def click(db, state, line, column, row):
-    """A click either picks one of your units or names a destination for the
-    one already picked, leaving a command ready for you to check and send."""
+    """Click one of your units to pick it, then a square to send it there.
+
+    Picking leaves `m <unit> ` in the prompt, which is both the visible sign of
+    what is selected and how the second click knows what to move. That second
+    click runs the move rather than typing it for you.
+    """
     spot = tile_clicked(state, column, row)
     if spot is None:
         return
@@ -324,10 +370,23 @@ def click(db, state, line, column, row):
     if unit:
         dispatch(db, state, f"s {unit['unit_id']}")
         line["text"] = f"m {unit['unit_id']} "
+        return
+
+    picked = re.fullmatch(r"m (\d+) ?", line["text"])
+    if not picked:
+        return
+    dispatch(db, state, f"m {picked.group(1)} {x} {y}")
+
+    # dispatch() clears the note before running, so a note now means the move
+    # was refused -- out of reach, or someone standing there. Stay selected and
+    # put the reachable squares back so the next click can just be a better
+    # one, rather than making you re-pick the unit.
+    if state["note"]:
+        line["text"] = f"m {picked.group(1)} "
+        state["highlight"] = {(t["x"], t["y"])
+                              for t in db.rows(REACHABLE, (int(picked.group(1)),))}
     else:
-        picked = re.fullmatch(r"m (\d+) ?", line["text"])
-        if picked:
-            line["text"] = f"m {picked.group(1)} {x} {y}"
+        line["text"] = ""
 
 
 def dispatch(db, state, line):
@@ -397,7 +456,7 @@ def run_scripted(db, state):
 
 def main():
     state = {"highlight": set(), "log": [], "note": "", "civ_id": None,
-             "history": [], "view": None, "running": True}
+             "history": [], "view": None, "overlay": None, "running": True}
     try:
         db = DB(echo=state["log"].append)
     except psycopg.OperationalError as exc:

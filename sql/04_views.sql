@@ -10,16 +10,37 @@ SET search_path TO game, public;
 -- its best ones. Ranking within each city is a window function; the cut-off
 -- depends on that city's population, which is why this is a separate view
 -- from the aggregate below.
+-- What a given civ gets out of a given terrain, once its techs are counted.
+--
+-- The base yield comes from terrain, the extras from every terrain_bonus row
+-- whose tech that civ has learned. Deriving this rather than storing it means
+-- a civ's rates change the instant a tech completes, with nothing to keep in
+-- step; the cost is that the join is recomputed whenever it is read.
+CREATE VIEW gathering_rate AS
+SELECT c.civ_id,
+       te.code                                        AS terrain,
+       te.food       + COALESCE(SUM(b.food), 0)       AS food,
+       te.production + COALESCE(SUM(b.production), 0) AS production,
+       te.gold       + COALESCE(SUM(b.gold), 0)       AS gold
+FROM civ c
+CROSS JOIN terrain te
+LEFT JOIN terrain_bonus b
+       ON b.terrain = te.code
+      AND EXISTS (SELECT 1 FROM civ_tech k
+                  WHERE k.civ_id = c.civ_id AND k.tech = b.tech)
+GROUP BY c.civ_id, te.code, te.food, te.production, te.gold;
+
 CREATE VIEW city_worked AS
 SELECT y.city_id, y.tile_id, y.food, y.production, y.gold
 FROM (
-  SELECT ct.city_id, ct.tile_id, te.food, te.production, te.gold,
+  SELECT ct.city_id, ct.tile_id, g.food, g.production, g.gold,
          ROW_NUMBER() OVER (PARTITION BY ct.city_id
-                            ORDER BY te.food + te.production + te.gold DESC,
+                            ORDER BY g.food + g.production + g.gold DESC,
                                      ct.tile_id) AS pick
   FROM city_tile ct
-  JOIN tile    ti ON ti.tile_id = ct.tile_id
-  JOIN terrain te ON te.code    = ti.terrain
+  JOIN city           c  ON c.city_id  = ct.city_id
+  JOIN tile           ti ON ti.tile_id = ct.tile_id
+  JOIN gathering_rate g  ON g.civ_id   = c.civ_id AND g.terrain = ti.terrain
 ) y
 JOIN city c ON c.city_id = y.city_id
 WHERE y.pick <= c.population;
@@ -95,6 +116,20 @@ RETURNS TABLE (x int, y int, glyph text, colour int)
 LANGUAGE sql STABLE AS $$
   SELECT t.x, t.y, te.glyph, te.colour
   FROM tile t JOIN terrain te ON te.code = t.terrain
+  WHERE t.x BETWEEN _x_min AND _x_max
+    AND t.y BETWEEN _y_min AND _y_max;
+$$;
+
+-- The same rectangle as map_window, but carrying what each tile would yield
+-- *for this civ* rather than what it looks like. Reads gathering_rate, so the
+-- numbers move when a tech lands -- research Mining and the hills light up.
+CREATE FUNCTION yield_window(_civ int, _x_min int, _x_max int,
+                             _y_min int, _y_max int)
+RETURNS TABLE (x int, y int, food int, production int, gold int)
+LANGUAGE sql STABLE AS $$
+  SELECT t.x, t.y, g.food, g.production, g.gold
+  FROM tile t
+  JOIN gathering_rate g ON g.civ_id = _civ AND g.terrain = t.terrain
   WHERE t.x BETWEEN _x_min AND _x_max
     AND t.y BETWEEN _y_min AND _y_max;
 $$;

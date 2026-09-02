@@ -40,6 +40,20 @@ CREATE TABLE tech_prereq (
   CHECK (tech <> requires)
 );
 
+-- How a tech changes what a terrain yields. One row per (tech, terrain) pair
+-- that is worth anything; a civ collects the bonus for every listed tech it
+-- knows. This is the rulebook -- gathering_rate in 04_views.sql turns it into
+-- what a particular civ actually gets.
+CREATE TABLE terrain_bonus (
+  tech       text NOT NULL REFERENCES tech,
+  terrain    text NOT NULL REFERENCES terrain,
+  food       int  NOT NULL DEFAULT 0,
+  production int  NOT NULL DEFAULT 0,
+  gold       int  NOT NULL DEFAULT 0,
+  PRIMARY KEY (tech, terrain),
+  CHECK (food <> 0 OR production <> 0 OR gold <> 0)
+);
+
 CREATE TABLE unit_type (
   code   text PRIMARY KEY,
   glyph  text NOT NULL,

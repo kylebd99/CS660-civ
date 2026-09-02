@@ -27,6 +27,38 @@ def paint(text, colour=None, *, bold=False, invert=False):
     return f"{prefix}{text}{RESET}" if prefix else text
 
 
+# A red-to-green ramp in ANSI 256 colour. Low is red, high is green, with
+# yellow in the middle -- the ordering people already expect from a heat map.
+HEAT = (196, 202, 208, 214, 220, 190, 154, 118, 82, 46)
+
+
+def heat(value, highest):
+    """Pick a colour from the ramp for `value` on a scale of 0 to `highest`.
+
+    Anchored at zero rather than at the lowest value on screen, so a barren
+    tile stays red instead of turning green just because everything around it
+    is barren too.
+    """
+    if highest <= 0:
+        return HEAT[0]
+    return HEAT[min(len(HEAT) - 1, value * len(HEAT) // (highest + 1))]
+
+
+def heat_tiles(rows, field):
+    """Turn yield rows into map cells coloured by one of their resources.
+
+    The glyph is the number itself, so the map reads as digits as well as
+    colour; a cell is one character wide, so anything past 9 becomes "+".
+    Returns (cells, highest) -- the caller wants the scale for its legend.
+    """
+    highest = max((row[field] for row in rows), default=0)
+    cells = [{"x": row["x"], "y": row["y"],
+              "glyph": str(row[field]) if row[field] < 10 else "+",
+              "colour": heat(row[field], highest)}
+             for row in rows]
+    return cells, highest
+
+
 def tile_at(origin, line, column):
     """Which tile covers (line, column) of the map block.
 
@@ -128,12 +160,13 @@ def draw_map(tiles, units, cities, highlight=frozenset(), coords=True,
     return ["".join(slots) for slots in grid], origin
 
 
-def draw_status(world, civ, cities):
+def draw_status(world, civ, cities, showing=None):
     """One line of civ-level state, then one line per city."""
     research = civ["researching"] or paint("nothing", 244)
     head = (f"{BOLD}turn {world['turn']}{RESET}  "
             f"{paint(civ['name'], civ['colour'], bold=True)}  "
-            f"{civ['gold']}g  {civ['science']} science  researching {research}")
+            f"{civ['gold']}g  {civ['science']} science  researching {research}"
+            + (f"   {paint(showing, 244)}" if showing else ""))
     body = [f"  @ {c['name']:<10} pop {c['population']}  "
             f"+{c['food']}F {c['production']}P {c['gold']}G  "
             f"{DIM}(stored {c['food_store']} food){RESET}"

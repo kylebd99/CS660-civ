@@ -14,8 +14,6 @@ RETURNS int LANGUAGE sql IMMUTABLE AS $$
 $$;
 
 -- The eight tiles touching (_x, _y), whether or not they exist on the map.
--- Drop the four diagonals from this list and the game becomes four-way; no
--- other code needs to know.
 CREATE FUNCTION neighbours(_x int, _y int)
 RETURNS TABLE (x int, y int) LANGUAGE sql IMMUTABLE AS $$
   SELECT _x + d.dx, _y + d.dy
