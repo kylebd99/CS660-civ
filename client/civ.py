@@ -39,13 +39,15 @@ TILES = "SELECT x, y, glyph, colour FROM map_window(%s, %s, %s, %s)"
 YIELDS = "SELECT x, y, food, production, gold FROM yield_window(%s, %s, %s, %s, %s)"
 
 # Where to look when you have not said: your first city, else your first unit.
+# The x, y tiebreak is load-bearing: with two units and no city, `ORDER BY rank`
+# alone let the planner pick either one, so the opening view moved between runs.
 VIEW_HOME = """SELECT x, y FROM (
                  SELECT t.x, t.y, 0 AS rank FROM city c
                    JOIN tile t ON t.tile_id = c.tile_id WHERE c.civ_id = %s
                  UNION ALL
                  SELECT t.x, t.y, 1 FROM unit u
                    JOIN tile t ON t.tile_id = u.tile_id WHERE u.civ_id = %s
-               ) home ORDER BY rank LIMIT 1"""
+               ) home ORDER BY rank, x, y LIMIT 1"""
 
 UNITS = """SELECT u.unit_id, u.civ_id, u.type, ut.glyph, u.moves_left,
                   u.actions_left, u.hp, t.x, t.y, c.colour

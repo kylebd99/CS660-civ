@@ -78,7 +78,8 @@ BEGIN
     WHERE te.passable AND NOT EXISTS (SELECT 1 FROM unit u WHERE u.tile_id = t.tile_id)
     ORDER BY distance(t.x, t.y,
                       (_width  * (2 * ((i - 1) % cols) + 1) / (2 * cols))::int,
-                      (_height * (2 * ((i - 1) / cols) + 1) / (2 * rows))::int)
+                      (_height * (2 * ((i - 1) / cols) + 1) / (2 * rows))::int),
+             t.x, t.y            -- several tiles tie on distance; pick one
     LIMIT 1;
 
     -- With enough civs on a small or watery map the land simply runs out.
@@ -97,7 +98,8 @@ BEGIN
     JOIN tile t    ON t.x = n.x AND t.y = n.y
     JOIN terrain te ON te.code = t.terrain
     WHERE te.passable AND NOT EXISTS (SELECT 1 FROM unit u WHERE u.tile_id = t.tile_id)
-    LIMIT 1;
+    ORDER BY t.x, t.y          -- at most eight rows; without this the escort
+    LIMIT 1;                   -- landed on a different side between runs
 
     IF guard IS NOT NULL THEN
       INSERT INTO unit (civ_id, type, tile_id, hp, moves_left, actions_left)

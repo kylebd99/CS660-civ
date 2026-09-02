@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# A PostgreSQL binary shipped as a wheel, run rootless in a temp directory.
+# It is why `make test` needs neither Docker nor a system Postgres.
+pgserver>=0.1
+pytest>=8
