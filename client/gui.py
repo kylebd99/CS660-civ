@@ -230,6 +230,7 @@ class View:
     ants: int = 0                              # marching-ants phase, in pixels
     tray: str | None = None                    # which list is open, if any
     placing: str | None = None                 # a bought unit, awaiting a tile
+    hover_row: str | None = None               # the tray row under the cursor
     line: dict = field(default_factory=lambda: {"text": "", "at": None,
                                                 "draft": ""})
     history: list = field(default_factory=list)   # typed lines only, not clicks
@@ -1019,43 +1020,55 @@ def tray_slots(rect, rows, ui):
     height = round(TRAY_ROW_H * ui)
     top = rect.top + round(52 * ui)
     out = []
-    for index, (key, *_rest) in enumerate(rows):
+    for index, row in enumerate(rows):
         line = pygame.Rect(rect.left + round(12 * ui), top + index * height,
                            rect.width - round(24 * ui), height - round(4 * ui))
         if line.bottom > rect.bottom - round(12 * ui):
             break
-        out.append((key, line))
+        out.append((row["key"], line))
     return out
 
 
+def row(key, label, right="", note="", enabled=True, colour=None, tip=None):
+    """One line of a tray.
+
+    `note` is short enough to sit inside the row; `tip` is a sentence, and is
+    shown beside the tray while the cursor is on the row.
+    """
+    return {"key": key, "label": label, "right": right, "note": note,
+            "enabled": enabled, "colour": colour, "tip": tip}
+
+
 def tray_contents(view, world):
-    """(title, rows) for the open tray, where a row is
-    (key, label, right, note, enabled, colour).
+    """(title, rows) for the open tray.
 
     The rows are the database's own rows, reshaped. Nothing is filtered out --
     a locked unit is shown greyed with what it needs, so the shop doubles as a
     reason to research something.
     """
     if view.tray == "buy":
-        rows = [(f"buy:{u['code']}", u["code"], f"{u['cost']}g",
-                 f"{u['moves']}mp  str {u['strength']}" if u["unlocked"]
-                 else f"needs {u['required_tech']}", u["unlocked"], None)
-                for u in world.get("shop", ())]
-        return "Buy a unit", rows
+        return "Buy a unit", [
+            row(f"buy:{u['code']}", u["code"], f"{u['cost']}g",
+                f"{u['moves']}mp  str {u['strength']}" if u["unlocked"]
+                else f"needs {u['required_tech']}", u["unlocked"])
+            for u in world.get("shop", ())]
     if view.tray == "research":
-        rows = [(f"tech:{t['code']}", t["code"], str(t["cost"]), "", True, None)
-                for t in world.get("techs", ())]
-        return "Research", rows
+        # tech.description, straight out of 03_seed.sql. Ninety science is a
+        # lot to spend on a word you have to guess the meaning of.
+        return "Research", [
+            row(f"tech:{t['code']}", t["code"], str(t["cost"]),
+                tip=t["description"]) for t in world.get("techs", ())]
     if view.tray == "civs":
-        rows = [(f"civ:{c['civ_id']}", c["name"], f"#{c['civ_id']}", "", True,
-                 palette.rgb(c["colour"])) for c in world.get("civs", ())]
-        return "Play as", rows
+        return "Play as", [
+            row(f"civ:{c['civ_id']}", c["name"], f"#{c['civ_id']}",
+                colour=palette.rgb(c["colour"])) for c in world.get("civs", ())]
     if view.tray == "new":
-        rows = [(f"field:{name}", name, str(view.newgame[name]), "", True, None)
-                for name, _low, _high in NEW_GAME_FIELDS]
-        return "New game", rows + [("deal", "Deal a world", "", "", True, None)]
+        return "New game", [
+            row(f"field:{name}", name, str(view.newgame[name]))
+            for name, _low, _high in NEW_GAME_FIELDS
+        ] + [row("deal", "Deal a world")]
     if view.tray == "help":
-        return "Keys", [(f"help:{n}", line, "", "", False, None)
+        return "Keys", [row(f"help:{n}", line, enabled=False)
                         for n, line in enumerate(KEYS_HELP.split("   "))]
     return None, []
 
@@ -1075,7 +1088,13 @@ def draw_tray(surface, bands, view, world):
           size=round(18 * ui), colour=FAINT, anchor="topright")
 
     slots = dict(tray_slots(rect, rows, ui))
-    for key, label, right, note, enabled, colour in rows:
+    for entry in rows:
+        if entry["key"] == view.hover_row and entry["enabled"]:
+            pygame.draw.rect(surface, EDGE, slots[entry["key"]].inflate(4, 2),
+                             border_radius=round(4 * ui))
+        key, label, right, note = (entry["key"], entry["label"],
+                                   entry["right"], entry["note"])
+        enabled, colour = entry["enabled"], entry["colour"]
         line = slots.get(key)
         if line is None:
             continue
@@ -1108,12 +1127,43 @@ def draw_tray(surface, bands, view, world):
             write(surface, right, (line.right - round(12 * ui), line.centery),
                   size=round(21 * ui), colour=ink, bold=True, anchor="midright")
         if note:
-            write(surface, note, (line.right - round(12 * ui), line.centery),
-                  size=round(17 * ui), colour=FAINT, anchor="midright") \
-                if not right else write(
-                    surface, note, (line.centerx, line.centery),
-                    size=round(17 * ui), colour=FAINT, anchor="center")
+            write(surface, note, (line.centerx + round(20 * ui), line.centery),
+                  size=round(17 * ui), colour=FAINT, anchor="center")
+
+    draw_tip(surface, bands, rect, rows, view)
     return slots
+
+
+def draw_tip(surface, bands, rect, rows, view):
+    """What the row under the cursor means, beside the tray.
+
+    Beside rather than under: the tray is already anchored to the bottom of the
+    map, and a panel below it would fall off the world. The text is the
+    database's own `tech.description`, so what a tech costs and what it does
+    come from the same row.
+    """
+    ui = bands.ui
+    wanted = next((entry for entry in rows
+                   if entry["key"] == view.hover_row and entry["tip"]), None)
+    if wanted is None:
+        return
+    line = dict(tray_slots(rect, rows, ui)).get(wanted["key"])
+    if line is None:
+        return
+
+    size = round(19 * ui)
+    pad = round(12 * ui)
+    width = round(300 * ui)
+    lines = wrap(wanted["tip"], width - 2 * pad, size)
+    tip = pygame.Rect(0, 0, width, len(lines) * size + 2 * pad)
+    tip.topleft = (rect.right + round(10 * ui), line.top - pad // 2)
+    tip.bottom = min(tip.bottom, bands.map.bottom - round(8 * ui))
+
+    pygame.draw.rect(surface, BACKDROP, tip, border_radius=round(6 * ui))
+    pygame.draw.rect(surface, ACCENT, tip, 1, border_radius=round(6 * ui))
+    for index, chunk in enumerate(lines):
+        write(surface, chunk, (tip.left + pad, tip.top + pad + index * size),
+              size=size, colour=INK)
 
 
 def draw_ghost(surface, board, view, world):
@@ -1209,6 +1259,7 @@ def handle(event, db, session, view, world):
     if event.type == pygame.MOUSEMOTION:
         if board is not None:
             view.hover = board.tile_at(event.pos)
+        view.hover_row = tray_row_at(view, world, event.pos)
         if view.panning:
             return True, drag(db, session, view, event.rel)
         return True, False
@@ -1453,6 +1504,22 @@ def deselect(session, view):
     view.selected = None
     view.trouble = ""
     game.clear_highlight(session)
+
+
+def tray_row_at(view, world, pos):
+    """Which row of the open tray a pixel is over, or None.
+
+    Costs no statement: the rows were fetched when the tray opened, and this
+    only asks which rectangle the cursor is in.
+    """
+    if view.tray is None or "bands" not in world:
+        return None
+    _title, rows = tray_contents(view, world)
+    rect = tray_rect(world["bands"], rows)
+    for key, line in tray_slots(rect, rows, world["bands"].ui):
+        if line.collidepoint(pos):
+            return key
+    return None
 
 
 def click_chrome(db, session, view, world, pos):

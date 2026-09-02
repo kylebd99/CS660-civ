@@ -25,9 +25,13 @@ CREATE TABLE terrain (
 );
 
 CREATE TABLE tech (
-  code text PRIMARY KEY,
-  name text NOT NULL,
-  cost int  NOT NULL CHECK (cost > 0)
+  code        text PRIMARY KEY,
+  name        text NOT NULL,
+  cost        int  NOT NULL CHECK (cost > 0),
+  -- One line on what knowing it does, for a client to show before you spend
+  -- ninety science on it. Prose rather than derived from terrain_bonus, so it
+  -- sits next to the rows it describes and the two get edited together.
+  description text NOT NULL
 );
 
 -- Edges of the tech DAG. "tech" cannot be researched until every "requires"

@@ -746,12 +746,12 @@ def test_the_shop_shows_locked_units_with_what_they_need(rome):
     view.tray = "buy"
     world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
     _title, rows = gui.tray_contents(view, world)
-    by_code = {label: row for row in rows for label in [row[1]]}
+    by_code = {entry["label"]: entry for entry in rows}
 
-    assert by_code["warrior"][4] is True
+    assert by_code["warrior"]["enabled"] is True
     # unit_shop.unlocked is the database's answer, and the note is its reason.
-    assert by_code["knight"][4] is False
-    assert by_code["knight"][3] == "needs bronze_working"
+    assert by_code["knight"]["enabled"] is False
+    assert by_code["knight"]["note"] == "needs bronze_working"
 
 
 def test_buying_hands_the_unit_to_the_cursor_and_the_map_places_it(rome):
@@ -812,10 +812,11 @@ def test_the_research_tray_offers_what_available_tech_offers(rome):
     view.tray = "research"
     world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
     _title, rows = gui.tray_contents(view, world)
-    assert {row[1] for row in rows} == {t["code"] for t in world["techs"]}
-    assert "agriculture" in {row[1] for row in rows}
+    assert {entry["label"] for entry in rows} == {t["code"]
+                                                  for t in world["techs"]}
+    assert "agriculture" in {entry["label"] for entry in rows}
     # currency needs bronze_working, so the frontier does not include it yet.
-    assert "currency" not in {row[1] for row in rows}
+    assert "currency" not in {entry["label"] for entry in rows}
 
     rect = gui.tray_rect(world["bands"], rows)
     slots = dict(gui.tray_slots(rect, rows, world["bands"].ui))
@@ -1506,3 +1507,114 @@ def test_the_terrain_legend_is_drawn_when_no_overlay_is(rome):
               for y in range(strip.top, strip.bottom, 2)}
     for kind in legend.values():
         assert palette.dim(palette.rgb(kind["colour"]), gui.TERRAIN_DIM) in pixels
+
+
+# --------------------------------------------------------- research tooltips
+# Ninety science is a lot to spend on a word whose meaning you have to guess.
+
+def test_every_tech_has_a_description(rome):
+    db, _session = rome
+    techs = db.rows("SELECT code, description FROM tech ORDER BY code")
+    assert len(techs) == 10
+    for tech in techs:
+        assert tech["description"].strip()
+        assert tech["description"].endswith(".")
+        assert len(tech["description"]) < 60          # it has to fit a tooltip
+
+
+def test_the_research_rows_carry_the_description(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "research"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    _title, rows = gui.tray_contents(view, world)
+
+    tips = {entry["label"]: entry["tip"] for entry in rows}
+    assert tips["mining"] == "+2 production from hills, the largest single bonus."
+    assert all(tip for tip in tips.values())
+    # The database's own column, not a table in this file.
+    assert tips == {t["code"]: t["description"] for t in world["techs"]}
+
+
+def test_moving_over_a_research_row_picks_it_up(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "research"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    slots = dict(gui.tray_slots(gui.tray_rect(world["bands"], rows), rows,
+                                world["bands"].ui))
+
+    gui.handle(event(pygame.MOUSEMOTION, pos=slots["tech:mining"].center,
+                     rel=(1, 0), buttons=(0, 0, 0)), db, session, view, world)
+    assert view.hover_row == "tech:mining"
+
+    # Off the tray, and it lets go rather than leaving a tooltip stranded.
+    gui.handle(event(pygame.MOUSEMOTION, pos=world["bands"].rail.center,
+                     rel=(1, 0), buttons=(0, 0, 0)), db, session, view, world)
+    assert view.hover_row is None
+
+
+def test_the_tooltip_is_drawn_beside_the_tray(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "research"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    rect = gui.tray_rect(world["bands"], rows)
+
+    bare = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(bare, world, session, view, {}, db)
+
+    view.hover_row = "tech:mining"
+    shown = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(shown, world, session, view, {}, db)
+
+    # Beside the tray, not over it: the tray already sits on the map's bottom
+    # edge, so a panel under it would fall off the world.
+    beside = pygame.Rect(rect.right, world["bands"].map.top,
+                         round(320 * world["bands"].ui),
+                         world["bands"].map.height)
+    assert pygame.image.tobytes(shown.subsurface(beside), "RGB") != \
+        pygame.image.tobytes(bare.subsurface(beside), "RGB")
+    pixels = {shown.get_at((x, y))[:3]
+              for x in range(beside.left, beside.right, 2)
+              for y in range(rect.top, rect.bottom, 2)}
+    assert gui.ACCENT in pixels                       # the tooltip's border
+
+
+def test_a_row_with_nothing_to_explain_has_no_tooltip(rome):
+    """The shop says what a unit needs in the row itself, so it has no tip and
+    hovering it draws nothing extra."""
+    db, session = rome
+    view = gui.View()
+    view.tray = "buy"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    assert all(entry["tip"] is None for entry in rows)
+
+    view.hover_row = "buy:knight"
+    shown = pygame.Surface(gui.DEFAULT_SIZE)
+    gui.draw(shown, world, session, view, {}, db)
+    rect = gui.tray_rect(world["bands"], rows)
+    beside = pygame.Rect(rect.right + 10, rect.top, round(300), rect.height)
+    pixels = {shown.get_at((x, y))[:3]
+              for x in range(beside.left, beside.right, 2)
+              for y in range(beside.top, beside.bottom, 3)}
+    assert gui.ACCENT not in pixels
+
+
+def test_hovering_a_row_costs_no_statement(rome):
+    db, session = rome
+    view = gui.View()
+    view.tray = "research"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    rows = gui.tray_contents(view, world)[1]
+    slots = dict(gui.tray_slots(gui.tray_rect(world["bands"], rows), rows,
+                                world["bands"].ui))
+
+    before, logged = db.quiet, len(session.log)
+    for key in slots:
+        gui.handle(event(pygame.MOUSEMOTION, pos=slots[key].center, rel=(1, 0),
+                         buttons=(0, 0, 0)), db, session, view, world)
+    assert (db.quiet, len(session.log)) == (before, logged)

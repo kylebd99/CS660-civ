@@ -11,17 +11,30 @@ INSERT INTO terrain (code, glyph, colour, food, production, gold, move_cost, pas
   ('hills',    'n', 137, 0, 3, 0, 2, true ),
   ('mountain', '^', 245, 0, 0, 0, 1, false);
 
-INSERT INTO tech (code, name, cost) VALUES
-  ('agriculture',      'Agriculture',      20),
-  ('mining',           'Mining',           20),
-  ('pottery',          'Pottery',          35),
-  ('animal_husbandry', 'Animal Husbandry', 35),
-  ('bronze_working',   'Bronze Working',   50),
-  ('writing',          'Writing',          60),
-  ('the_wheel',        'The Wheel',        60),
-  ('currency',         'Currency',         90),
-  ('mathematics',      'Mathematics',     120),
-  ('philosophy',       'Philosophy',      120);
+-- The descriptions say what the terrain_bonus rows below, and unit_type's
+-- required_tech column, add up to for each tech. They are the one thing here a
+-- client shows without deriving it, so they have to be kept honest by hand.
+INSERT INTO tech (code, name, cost, description) VALUES
+  ('agriculture',      'Agriculture',      20,
+   '+1 food from grassland. The root of the tree.'),
+  ('mining',           'Mining',           20,
+   '+2 production from hills, the largest single bonus.'),
+  ('pottery',          'Pottery',          35,
+   '+1 food from ocean, so a coastal city stops starving.'),
+  ('animal_husbandry', 'Animal Husbandry', 35,
+   '+1 food from plains.'),
+  ('bronze_working',   'Bronze Working',   50,
+   '+1 production from forest, and unlocks the knight.'),
+  ('writing',          'Writing',          60,
+   'No yields of its own; the only road to Philosophy.'),
+  ('the_wheel',        'The Wheel',        60,
+   '+1 production from plains.'),
+  ('currency',         'Currency',         90,
+   '+1 gold from grassland and from plains.'),
+  ('mathematics',      'Mathematics',     120,
+   'No yields, and nothing beyond it. Prestige only.'),
+  ('philosophy',       'Philosophy',      120,
+   'No yields, and nothing beyond it. Prestige only.');
 
 -- The DAG. currency and mathematics each need two prerequisites, which is what
 -- makes "what can I research?" a genuine division rather than a simple join.

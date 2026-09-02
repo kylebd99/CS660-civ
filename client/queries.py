@@ -57,8 +57,10 @@ CITIES = """SELECT ci.city_id, ci.civ_id, ci.name, ci.population, ci.food_store,
             JOIN city_yield y  ON y.city_id  = ci.city_id
             ORDER BY ci.city_id"""
 
-AVAILABLE_TECH = """SELECT code, name, cost FROM available_tech
-                    WHERE civ_id = %s ORDER BY cost, code"""
+AVAILABLE_TECH = """SELECT a.code, a.name, a.cost, t.description
+                    FROM available_tech a
+                    JOIN tech t ON t.code = a.code
+                    WHERE a.civ_id = %s ORDER BY a.cost, a.code"""
 
 REACHABLE = "SELECT x, y, cost FROM reachable(%s)"
 
