@@ -1,9 +1,12 @@
-"""civ -- a Civ-like whose entire state and rules live in PostgreSQL.
+"""civ -- the terminal front-end.
 
-The client does not know the rules of the game. It reads views to find out what
-is true, calls functions to change it, and draws the result. Every statement it
-sends to change the world is printed under the map, and `:` lets you send your
-own. If you want to know how the game works, read sql/, not this file.
+The rules are in sql/, the statements in queries.py, and everything any
+front-end needs in game.py. What is left here is what only a terminal needs:
+turning typed words into calls, turning rows into characters, and the loop.
+
+Every statement sent to change the world is printed under the map, and `:` lets
+you send your own. If you want to know how the game works, read sql/, not this
+file.
 
     python3 client/civ.py
 """
@@ -14,177 +17,124 @@ import sys
 
 import psycopg
 
-from db import DB
+import game
 import input_management as im
-import queries as q
 import render
-
-
-def view_centre(db, state):
-    """Middle of the view, as a tile (x, y). Unset, it follows your pieces."""
-    if state["view"] is None:
-        home = db.one(q.VIEW_HOME, (active_civ(db, state),) * 2)
-        state["view"] = (home["x"], home["y"]) if home else (0, 0)
-    return state["view"]
-
-
-def use_civ(db, state, civ_id):
-    """Point this session at a civ, on both sides of the wire.
-
-    The database half is what matters: the rules functions read
-    current_civ() rather than trusting a civ id passed in with the request, so
-    the server decides what you may touch. Telling the client alone would let
-    any `:` query act for anyone.
-    """
-    state["civ_id"] = civ_id
-    state["view"] = None        # look at the new player's own territory
-    db.call(q.SET_SESSION_CIV, (str(civ_id),))
-
-
-def active_civ(db, state):
-    """Which civ this terminal is playing. Defaults to the first one, and is
-    re-defaulted whenever a new world is dealt.
-
-    Two terminals on the same database are two players.
-    """
-    if state["civ_id"] is None:
-        row = db.one(q.FIRST_CIV)
-        if row and row["civ_id"] is not None:
-            use_civ(db, state, row["civ_id"])
-    return state["civ_id"]
-
+from db import DB
 
 # ------------------------------------------------------------------ commands
-# Each takes (db, state, args) and either calls the database or changes what is
-# highlighted. `state` holds only presentation: the game itself is in Postgres.
+# Each takes (db, session, ui, args) and is deliberately thin: parse the words,
+# call game, format a note. `session` is what both front-ends hold; `ui` is
+# this one's own -- the note under the map, the command history, whether to
+# keep going.
 
-def cmd_new(db, state, args):
-    width = int(args[0]) if args else 30
-    height = int(args[1]) if len(args) > 1 else 16
-    civs = int(args[2]) if len(args) > 2 else 1
-    seed = int(args[3]) if len(args) > 3 else 42
-    db.call(q.NEW_GAME, (width, height, seed, civs))
-    state["civ_id"] = None      # whoever you were does not exist any more
-    state["view"] = None
-
-
-def cmd_move(db, state, args):
-    unit, x, y = int(args[0]), int(args[1]), int(args[2])
-    db.call(q.MOVE_UNIT, (unit, x, y))
+def cmd_new(db, session, ui, args):
+    game.new_game(db, session,
+                  width=int(args[0]) if args else 30,
+                  height=int(args[1]) if len(args) > 1 else 16,
+                  civs=int(args[2]) if len(args) > 2 else 1,
+                  seed=int(args[3]) if len(args) > 3 else 42)
 
 
-def cmd_buy(db, state, args):
+def cmd_move(db, session, ui, args):
+    game.move(db, int(args[0]), int(args[1]), int(args[2]))
+
+
+def cmd_buy(db, session, ui, args):
     """`b` alone prices the catalogue; `b <type> <x> <y>` buys one and puts it
     down. Two forms of one command, like `t`."""
     if not args:
         # Locked units are shown too, greyed out with what they need, so the
         # shop doubles as a reason to research something.
-        state["note"] = "  " + "   ".join(
+        ui["note"] = "  " + "   ".join(
             f"{u['code']} {u['cost']}g ({u['moves']}mp str{u['strength']})"
             if u["unlocked"] else
             render.paint(f"{u['code']} needs {u['required_tech']}", 244)
-            for u in db.rows(q.UNIT_SHOP, (active_civ(db, state),)))
+            for u in game.unit_shop(db, game.active_civ(db, session)))
         return
-    kind, x, y = args[0], int(args[1]), int(args[2])
-    state["note"] = f"  {db.call(q.BUY_UNIT, (kind, x, y))['outcome']}"
+    ui["note"] = "  " + game.buy(db, args[0], int(args[1]), int(args[2]))
 
 
-def cmd_attack(db, state, args):
+def cmd_attack(db, session, ui, args):
     """Strike an adjacent enemy. The outcome comes back as a sentence, because
     the interesting part is what happened, not a number."""
-    unit, x, y = int(args[0]), int(args[1]), int(args[2])
-    hit = db.call(q.ATTACK, (unit, x, y))
-    state["note"] = f"  {hit['outcome']}"
+    ui["note"] = "  " + game.attack(db, int(args[0]), int(args[1]), int(args[2]))
 
 
-def cmd_found(db, state, args):
-    name = " ".join(args[1:]) or "New City"
-    db.call(q.FOUND_CITY, (int(args[0]), name))
+def cmd_found(db, session, ui, args):
+    game.found_city(db, int(args[0]), " ".join(args[1:]) or "New City")
 
 
-def cmd_research(db, state, args):
-    me = active_civ(db, state)
+def cmd_research(db, session, ui, args):
+    me = game.active_civ(db, session)
     if not args:
-        state["note"] = "  " + "   ".join(
-            f"{t['code']} ({t['cost']})" for t in db.rows(q.AVAILABLE_TECH, (me,)))
+        ui["note"] = "  " + "   ".join(
+            f"{t['code']} ({t['cost']})" for t in game.available_techs(db, me))
         return
-    db.call(q.SET_RESEARCH, (args[0],))
+    game.set_research(db, args[0])
 
 
-def cmd_reach(db, state, args):
-    unit = int(args[0])
-    state["highlight"] = {(row["x"], row["y"]) for row in db.rows(q.REACHABLE, (unit,))}
-    state["log"].append(db.rendered(q.REACHABLE, (unit,)))
+def cmd_reach(db, session, ui, args):
+    game.highlight_reachable(db, session, int(args[0]))
 
 
-def cmd_end(db, state, args):
-    db.call(q.END_TURN)
+def cmd_end(db, session, ui, args):
+    game.end_turn(db)
 
 
-def cmd_sql(db, state, args):
+def cmd_sql(db, session, ui, args):
     """Send arbitrary SQL to the live game. This is the whole pitch: the world
     is a database, so anything you can express you can do."""
-    sql = " ".join(args)
-    rows = db.rows(sql)
-    state["log"].append(sql)
-    state["note"] = render.format_rows(rows)
+    ui["note"] = render.format_rows(game.run_sql(db, session, " ".join(args)))
 
 
-# What `y` will accept, and which column of yield_window each one colours.
-OVERLAYS = {"food": "food", "f": "food",
-            "production": "production", "prod": "production", "p": "production",
-            "gold": "gold", "g": "gold"}
-
-
-def cmd_yield(db, state, args):
+def cmd_yield(db, session, ui, args):
     """Colour the map by what tiles are worth instead of what they are.
 
     `y` on its own goes back to terrain. Red is nothing, green is the best in
     view, and the glyph is the number, so the map can be read either way.
     """
     if not args:
-        state["overlay"] = None
+        session.overlay = None
         return
-    field = OVERLAYS.get(args[0].lower())
+    field = game.OVERLAYS.get(args[0].lower())
     if field is None:
-        state["note"] = ("  show what? " + " ".join(sorted(set(OVERLAYS.values())))
-                         + "   (`y` alone returns to terrain)")
+        ui["note"] = ("  show what? "
+                      + " ".join(sorted(set(game.OVERLAYS.values())))
+                      + "   (`y` alone returns to terrain)")
         return
-    state["overlay"] = field
+    session.overlay = field
 
 
-def cmd_view(db, state, args):
+def cmd_view(db, session, ui, args):
     """Centre the view on a tile. `v` alone goes back to following your pieces,
     which is also what shift+arrow panning steps away from."""
-    if not args:
-        state["view"] = None
-        return
-    state["view"] = (int(args[0]), int(args[1]))
+    game.look_at(session, *(int(a) for a in args[:2]))
 
 
-def cmd_play_as(db, state, args):
+def cmd_play_as(db, session, ui, args):
     """Choose which civ this terminal plays. With no argument, list them."""
-    civs = db.rows(q.ALL_CIVS)
+    civs = game.all_civs(db)
     if not args:
-        me = active_civ(db, state)
-        state["note"] = "  " + "   ".join(
+        me = game.active_civ(db, session)
+        ui["note"] = "  " + "   ".join(
             ("* " if c["civ_id"] == me else "  ")
             + f"{c['civ_id']}:" + render.paint(c["name"], c["colour"], bold=True)
             for c in civs)
         return
     wanted = int(args[0])
     if wanted not in {c["civ_id"] for c in civs}:
-        state["note"] = f"  no civ {wanted} -- press `p` to list them"
+        ui["note"] = f"  no civ {wanted} -- press `p` to list them"
         return
-    use_civ(db, state, wanted)
+    game.use_civ(db, session, wanted)
 
 
-def cmd_help(db, state, args):
-    state["note"] = "\n".join(f"  {help_text}" for _, help_text in COMMANDS.values())
+def cmd_help(db, session, ui, args):
+    ui["note"] = "\n".join(f"  {help_text}" for _, help_text in COMMANDS.values())
 
 
-def cmd_quit(db, state, args):
-    state["running"] = False
+def cmd_quit(db, session, ui, args):
+    ui["running"] = False
 
 
 COMMANDS = {
@@ -207,27 +157,17 @@ COMMANDS = {
 
 # -------------------------------------------------------------------- screen
 
-def screen(db, state):
-    world = db.one(q.WORLD)
-    if world is None:
+def screen(db, session, ui):
+    snap = game.snapshot(db, session)
+    if snap is None:
         # Show the note too: an error from the `n` that just failed is exactly
         # what you need to see here.
         return ["No world yet. Type `n` to start a game, `?` for help.",
-                state["note"]]
-
-    me = active_civ(db, state)
-    civ = db.one(q.CIV, (me,))
-    units, cities = db.rows(q.UNITS), db.rows(q.CITIES)
-
-    # The map draws every civ's pieces, because you can see them standing
-    # there; they are told apart by colour. Everything below the map is your
-    # own dossier, so it is filtered to the civ you are playing. Hiding rival
-    # pieces is fog of war, which is a different question and not built yet.
-    mine = lambda rows: [row for row in rows if row["civ_id"] == me]
+                ui["note"]]
 
     # Built once to measure, since the overlay label changes the first line's
     # content but never the line count, and the window needs that count.
-    status = render.draw_status(world, civ, mine(cities))
+    status = render.draw_status(snap["world"], snap["civ"], snap["my_cities"])
 
     # Size the window to whatever is left of the terminal after the status
     # block, two blank lines, the unit line, a possible note, the log and the
@@ -235,112 +175,110 @@ def screen(db, state):
     columns, rows = shutil.get_terminal_size((80, 24))
     wide = max(10, (columns - 1) // render.CELL_WIDTH)
     high = max(5, rows - (len(status) + 10))
-    cx, cy = view_centre(db, state)
-    window = (cx - wide // 2, cx + wide // 2, cy - high // 2, cy + high // 2)
+    window = game.window_for(game.view_centre(db, session), wide, high)
 
-    # Terrain, or the same window recoloured by one resource. draw_map is told
-    # nothing about overlays: it is handed cells with a glyph and a colour
-    # either way, and does not care where they came from.
-    showing = None
-    if state["overlay"]:
-        rates = db.rows(q.YIELDS, (me, *window))
-        tiles, highest = render.heat_tiles(rates, state["overlay"])
-        showing = f"showing {state['overlay']} 0-{highest}"
+    # draw_map is told nothing about overlays: it is handed cells with a glyph
+    # and a colour either way, and does not care where they came from.
+    cells, highest = game.tiles_in(db, session, window)
+    if highest is None:
+        tiles = cells
     else:
-        tiles = db.rows(q.TILES, window)
+        tiles = render.heat_cells(cells, highest)
+        status = render.draw_status(snap["world"], snap["civ"], snap["my_cities"],
+                                    f"showing {session.overlay} 0-{highest}")
 
-    if showing:
-        status = render.draw_status(world, civ, mine(cities), showing)
-
-    map_lines, origin = render.draw_map(tiles, units, cities, state["highlight"],
-                                        window=window)
+    map_lines, origin = render.draw_map(tiles, snap["units"], snap["cities"],
+                                        session.highlight, window=window)
 
     # Remember where the map landed on screen, so a mouse click can be turned
     # back into a tile. One blank line separates it from the status block.
-    state["map_at"] = (len(status) + 1, origin)
-    state["map_tiles"] = {(t["x"], t["y"]) for t in tiles}
+    ui["map_at"] = (len(status) + 1, origin)
+    ui["map_tiles"] = {(tile["x"], tile["y"]) for tile in tiles}
 
     return [*status,
             "",
             *map_lines,
             "",
-            render.unit_line(mine(units)),
-            *([state["note"]] if state["note"] else []),
-            *render.draw_log(state["log"])]
+            render.unit_line(snap["my_units"]),
+            *([ui["note"]] if ui["note"] else []),
+            *render.draw_log(session.log)]
 
 
-def tile_clicked(state, column, row):
+# ------------------------------------------------------------------ clicking
+
+def tile_clicked(ui, column, row):
     """The tile under a click, or None if it missed the map.
 
     Mouse reports count from 1 and so do terminal rows, while the frame is a
     list starting at 0.
     """
-    if "map_at" not in state:
+    if "map_at" not in ui:
         return None
-    first_line, origin = state["map_at"]
+    first_line, origin = ui["map_at"]
     line = (row - 1) - first_line
     if line < 0:
         return None
     spot = render.tile_at(origin, line, column - 1)
-    return spot if spot in state["map_tiles"] else None
+    return spot if spot in ui["map_tiles"] else None
 
 
-def click(db, state, line, column, row):
+def click(db, session, ui, line, column, row):
     """Click one of your units to pick it, then a square to send it there.
 
     Picking leaves `m <unit> ` in the prompt, which is both the visible sign of
     what is selected and how the second click knows what to move. That second
     click runs the move rather than typing it for you.
     """
-    spot = tile_clicked(state, column, row)
+    spot = tile_clicked(ui, column, row)
     if spot is None:
         return
     x, y = spot
-    unit = db.one(q.MY_UNIT_AT, (x, y, active_civ(db, state)))
+    unit = game.my_unit_at(db, x, y, game.active_civ(db, session))
     if unit:
-        dispatch(db, state, f"s {unit['unit_id']}")
-        line["text"] = f"m {unit['unit_id']} "
+        dispatch(db, session, ui, f"s {unit}")
+        line["text"] = f"m {unit} "
         return
 
     picked = re.fullmatch(r"m (\d+) ?", line["text"])
     if not picked:
         return
-    dispatch(db, state, f"m {picked.group(1)} {x} {y}")
+    dispatch(db, session, ui, f"m {picked.group(1)} {x} {y}")
 
     # dispatch() clears the note before running, so a note now means the move
     # was refused -- out of reach, or someone standing there. Stay selected and
     # put the reachable squares back so the next click can just be a better
     # one, rather than making you re-pick the unit.
-    if state["note"]:
+    if ui["note"]:
         line["text"] = f"m {picked.group(1)} "
-        state["highlight"] = {(t["x"], t["y"])
-                              for t in db.rows(q.REACHABLE, (int(picked.group(1)),))}
+        session.highlight = game.reachable(db, int(picked.group(1)))
     else:
         line["text"] = ""
 
 
-def dispatch(db, state, line):
+# ------------------------------------------------------------------- the loop
+
+def dispatch(db, session, ui, line):
     """Run one typed command."""
     verb, args = line[0], line[1:].split()
     if verb not in COMMANDS:
-        state["note"] = f"  unknown command {verb!r} -- press ? for help"
+        ui["note"] = f"  unknown command {verb!r} -- press ? for help"
         return
     # `s` is the only command that leaves a highlight behind. Clearing here
     # rather than in each handler means a new command can never forget to,
     # and reachability can never linger over a world that has since moved.
-    state["highlight"] = set()
-    state["note"] = ""
+    game.clear_highlight(session)
+    ui["note"] = ""
     try:
-        COMMANDS[verb][0](db, state, args)
+        COMMANDS[verb][0](db, session, ui, args)
     except psycopg.Error as exc:
         # Constraint violations and rule errors land here. Showing them is
         # the point: the database refusing an illegal move is a feature.
-        state["note"] = f"  {render.paint(str(exc).strip(), 203)}"
+        ui["note"] = f"  {render.paint(str(exc).strip(), 203)}"
     except (ValueError, IndexError):
-        state["note"] = f"  usage: {COMMANDS[verb][1]}"
+        ui["note"] = f"  usage: {COMMANDS[verb][1]}"
 
 
-def run_interactive(db, state):
+def run_interactive(db, session, ui):
     """Redraw on a timer as well as on input.
 
     Without this the screen only changes when you press a key, so a rival
@@ -352,49 +290,47 @@ def run_interactive(db, state):
     """
     line = {"text": "", "at": None, "draft": ""}
     with im.terminal():
-        while state["running"]:
-            render.emit(screen(db, state) + ["", f"> {line['text']}"])
+        while ui["running"]:
+            render.emit(screen(db, session, ui) + ["", f"> {line['text']}"])
             for key in im.keys():
                 press = im.mouse_press(key)
                 if key in ("\x03", "\x04"):        # Ctrl-C, Ctrl-D
-                    state["running"] = False
+                    ui["running"] = False
                 elif key in im.PAN:
-                    dx, dy = im.PAN[key]
-                    cx, cy = view_centre(db, state)
-                    state["view"] = (cx + dx, cy + dy)
+                    game.pan(db, session, *im.PAN[key])
                 elif press:
-                    click(db, state, line, *press)
+                    click(db, session, ui, line, *press)
                 else:
-                    done = im.edit_line(line, key, state["history"])
+                    done = im.edit_line(line, key, ui["history"])
                     if done:
-                        if state["history"][-1:] != [done]:
-                            state["history"].append(done)
-                        dispatch(db, state, done)
+                        if ui["history"][-1:] != [done]:
+                            ui["history"].append(done)
+                        dispatch(db, session, ui, done)
 
 
-def run_scripted(db, state):
+def run_scripted(db, session, ui):
     """stdin is a pipe, so there is no one to watch a live screen. Read the
     commands as lines and skip the refresh loop entirely."""
     for line in sys.stdin:
-        if not state["running"]:
+        if not ui["running"]:
             break
-        render.emit(screen(db, state) + ["", f"> {line.strip()}"])
+        render.emit(screen(db, session, ui) + ["", f"> {line.strip()}"])
         if line.strip():
-            dispatch(db, state, line.strip())
-    render.emit(screen(db, state))
+            dispatch(db, session, ui, line.strip())
+    render.emit(screen(db, session, ui))
 
 
 def main():
-    state = {"highlight": set(), "log": [], "note": "", "civ_id": None,
-             "history": [], "view": None, "overlay": None, "running": True}
+    session = game.Session()
+    ui = {"note": "", "history": [], "running": True}
     try:
-        db = DB(echo=state["log"].append)
+        db = DB(echo=session.log.append)
     except psycopg.OperationalError as exc:
         sys.exit(f"cannot reach the database: {exc}\ntry: docker compose up -d && make reset")
 
     print("\x1b[2J", end="")                    # one clear, then render.emit() overwrites
     try:
-        (run_interactive if sys.stdin.isatty() else run_scripted)(db, state)
+        (run_interactive if sys.stdin.isatty() else run_scripted)(db, session, ui)
     finally:
         print("\x1b[?25h")                      # make sure the cursor is visible
 

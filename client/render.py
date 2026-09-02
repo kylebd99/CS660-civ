@@ -44,19 +44,21 @@ def heat(value, highest):
     return HEAT[min(len(HEAT) - 1, value * len(HEAT) // (highest + 1))]
 
 
-def heat_tiles(rows, field):
-    """Turn yield rows into map cells coloured by one of their resources.
+def heat_cells(cells, highest):
+    """Overlay cells from game.overlay_cells(), ready for draw_map().
 
     The glyph is the number itself, so the map reads as digits as well as
     colour; a cell is one character wide, so anything past 9 becomes "+".
-    Returns (cells, highest) -- the caller wants the scale for its legend.
+
+    The colour comes from `value` and `highest` rather than from the cell's
+    `intensity`, which is the same bucketing by a different route. Integer
+    division is exact, and a terminal palette does not need the float --
+    intensity is there for a front-end with a continuous colour space.
     """
-    highest = max((row[field] for row in rows), default=0)
-    cells = [{"x": row["x"], "y": row["y"],
-              "glyph": str(row[field]) if row[field] < 10 else "+",
-              "colour": heat(row[field], highest)}
-             for row in rows]
-    return cells, highest
+    return [{"x": cell["x"], "y": cell["y"],
+             "glyph": str(cell["value"]) if cell["value"] < 10 else "+",
+             "colour": heat(cell["value"], highest)}
+            for cell in cells]
 
 
 def tile_at(origin, line, column):

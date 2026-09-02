@@ -23,6 +23,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLIENT = ROOT / "client"
 SQL = ROOT / "sql"
 
+# client/ is not a package: `python3 client/civ.py` works because that puts the
+# directory on sys.path, and the flat imports there rely on it. Tests are not
+# run from inside client/, so they have to arrange the same thing.
+sys.path.insert(0, str(CLIENT))
+
 # Matches every escape sequence the terminal client emits, so a frame can be
 # compared as plain text.
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -63,9 +68,9 @@ def game(db):
 def play(dsn):
     """Drive the terminal client with a piped script.
 
-    civ.py takes its scripted path when stdin is not a tty (civ.py:445), which
-    emits one frame per command -- so no pty is needed to capture what the
-    client drew. Returns the frames as plain text, escapes stripped.
+    civ.py takes its scripted path when stdin is not a tty, and that path emits
+    one frame per command -- so no pty is needed to capture what the client
+    drew. Returns the frames as plain text, escapes stripped.
     """
     def run(script, columns=80, lines=24, civ=None):
         env = {**os.environ, "CIV_DSN": dsn,
