@@ -219,10 +219,8 @@ def new_game(db, session, width=30, height=16, civs=1, seed=42):
 
 def run_sql(db, session, sql):
     """Send arbitrary SQL. This is the whole pitch: the world is a database, so
-    anything you can express you can do. Logged, because everything is."""
-    rows = db.rows(sql)
-    session.log.append(sql)
-    return rows
+    anything you can express you can do. Watched, because you typed it."""
+    return db.watched(sql)
 
 
 # --------------------------------------------------------------- highlighting
@@ -230,11 +228,11 @@ def run_sql(db, session, sql):
 def highlight_reachable(db, session, unit):
     """Light up where a unit could walk.
 
-    Logged by hand: reachable() is a read, so db.call would not echo it, but
-    a recursive CTE is worth watching go past.
+    Watched rather than silent: it is only a read, but a recursive walk over
+    the map is worth seeing go past.
     """
-    session.highlight = reachable(db, unit)
-    session.log.append(db.rendered(q.REACHABLE, (unit,)))
+    session.highlight = {(row["x"], row["y"]): row["cost"]
+                         for row in db.watched(q.REACHABLE, (unit,))}
 
 
 def clear_highlight(session):

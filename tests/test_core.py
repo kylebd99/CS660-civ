@@ -21,6 +21,16 @@ import queries as q
 
 CLIENT = pathlib.Path(dbapi.__file__).parent
 
+def statements(session):
+    """The log as plain SQL.
+
+    Entries are db.Sent records: the statement, how long it took, how many rows
+    it returned, and the SQLSTATE if PostgreSQL refused it. Most assertions
+    only care about the first of those.
+    """
+    return [entry.sql for entry in session.log]
+
+
 
 @pytest.fixture
 def core_db(dsn):
@@ -340,8 +350,11 @@ def test_writes_are_logged_and_redraws_are_not(rome):
     core.snapshot(db, session)
     core.tiles_in(db, session, core.window_for((8, 7), 5, 5))
     assert session.log == []                        # reads would drown the rest
-    core.move(db, WARRIOR, 8, 6)
-    assert session.log == ["SELECT move_unit(2, 8, 6) AS cost"]
+    assert db.quiet > 0                             # counted, though, so that
+    core.move(db, WARRIOR, 8, 6)                    # the log can say how many
+    assert statements(session) == ["SELECT move_unit(2, 8, 6) AS cost"]
+    assert session.log[0].rows == 1                 # and what came back
+    assert session.log[0].ms > 0
 
 
 def test_typed_sql_is_logged_even_though_it_is_a_read(rome):
@@ -349,7 +362,7 @@ def test_typed_sql_is_logged_even_though_it_is_a_read(rome):
     session.log.clear()
     rows = core.run_sql(db, session, "SELECT count(*) AS n FROM unit")
     assert rows[0]["n"] == 4
-    assert session.log == ["SELECT count(*) AS n FROM unit"]
+    assert statements(session) == ["SELECT count(*) AS n FROM unit"]
 
 
 def test_asking_where_a_unit_can_go_shows_the_recursive_query(rome):
@@ -358,7 +371,7 @@ def test_asking_where_a_unit_can_go_shows_the_recursive_query(rome):
     assert (7, 6) in session.highlight
     # Logged although it is only a read: the recursive walk is worth watching
     # go past, even though the WITH RECURSIVE itself lives in 04_views.sql.
-    assert session.log[-1] == "SELECT x, y, cost FROM reachable(2)"
+    assert statements(session)[-1] == "SELECT x, y, cost FROM reachable(2)"
     core.clear_highlight(session)
     assert session.highlight == {}
 

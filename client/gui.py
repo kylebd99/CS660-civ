@@ -22,6 +22,7 @@ import pygame
 import game
 import input_management as im     # for edit_line alone: one line editor, both
 import palette
+import queries as q                # to preview a statement without sending it
 import render                      # for HEAT alone: one ramp, both front-ends
 from db import DB
 
@@ -232,6 +233,7 @@ class View:
                                                 "draft": ""})
     history: list = field(default_factory=list)   # typed lines only, not clicks
     result: list | None = None                 # rows a typed statement returned
+    log_all: bool = False                      # roll the silent reads up too
     newgame: dict = field(default_factory=      # what the New game tray holds
                           lambda: {"width": 40, "height": 24,
                                    "civs": 2, "seed": 42})
@@ -559,13 +561,94 @@ def draw_context(surface, rect, snap, view, world, legend, ui):
                 break
 
 
-def draw_rail(surface, rect, log, ui):
-    """Every statement that changed the world, newest first.
+def rail_layout(rect, log, ui, quiet=0, all_reads=False):
+    """What the rail shows, newest first: a list of laid-out entries.
 
-    Three brightnesses rather than one: from the back of a room you can always
-    read the statement that just went out, and the ones before it are context
-    you can lean in for.
+    Three sizes rather than one. From the back of a room you can always read
+    the statement that just went out; the ones before it are context you can
+    lean in for. This is the terminal's draw_log(keep=4) grown to as many as
+    fit, with a size-and-brightness ramp instead of one dim grey.
+
+    Computed apart from the drawing so that a click can be tested against the
+    same rectangles the entries were drawn in -- clicking one loads it back
+    into the prompt, and re-running a statement to watch its answer change is
+    the whole teaching loop.
     """
+    if not rect.height:
+        return []
+    pad = round(16 * ui)
+    line = rect.top + pad + round(30 * ui)
+    width = rect.width - 2 * pad
+    out = []
+
+    if all_reads and quiet:
+        out.append({"index": None, "entry": None, "size": round(15 * ui),
+                    "colour": FAINT, "lines": [f"+ {quiet:,} reads behind "
+                                               f"redraws"],
+                    "rect": pygame.Rect(rect.left + pad, line, width,
+                                        round(15 * ui))})
+        line += round(22 * ui)
+
+    for age, entry in enumerate(reversed(log)):
+        size, colour = ((round(22 * ui), INK) if age == 0 else
+                        (round(18 * ui), MUTED) if age < 4 else
+                        (round(15 * ui), FAINT))
+        lines = wrap(str(entry), width, size)
+        note = getattr(entry, "outcome", None)
+        high = size * len(lines) + (round(17 * ui) if note else 0)
+        if line + high > rect.bottom - round(46 * ui):
+            break
+        out.append({"index": len(log) - 1 - age, "entry": entry, "size": size,
+                    "colour": colour, "lines": lines,
+                    "rect": pygame.Rect(rect.left + pad, line, width, high)})
+        line += high + round(8 * ui)
+    return out
+
+
+def would_send(db, view, world):
+    """The statement a click where the mouse is would issue, or None.
+
+    Rendered from the same query constant the click would use, so the preview
+    is the statement, character for character -- the lecturer says "watch what
+    this is about to send", clicks, and the room sees that exact text go from
+    grey to white in the log. Client-side: nothing is sent to find out.
+    """
+    if view.hover is None or db is None or not world.get("snap"):
+        return None
+    x, y = view.hover
+    if view.placing:
+        return db.rendered(q.BUY_UNIT, (view.placing, x, y))
+
+    mine = next((u for u in world["snap"]["my_units"]
+                 if (u["x"], u["y"]) == (x, y)), None)
+    if mine:
+        return db.rendered(q.REACHABLE, (mine["unit_id"],))
+    if view.selected is None:
+        return None
+    foe = occupant(world, x, y)
+    if foe is not None and foe["civ_id"] != world["snap"]["civ_id"]:
+        return db.rendered(q.ATTACK, (view.selected, x, y))
+    return db.rendered(q.MOVE_UNIT, (view.selected, x, y))
+
+
+def rail_toggle(rect, ui):
+    """The `writes | all` control in the rail's header: name -> rect."""
+    if not rect.height:
+        return {}
+    size = round(18 * ui)
+    right = rect.right - round(16 * ui)
+    slots = {}
+    for name in ("all", "writes"):
+        width = font(size).size(name)[0]
+        slot = pygame.Rect(right - width, rect.top + round(14 * ui), width,
+                           size)
+        slots[name] = slot
+        right -= width + round(14 * ui)
+    return slots
+
+
+def draw_rail(surface, rect, session, view, world, db, ui):
+    """Every statement that changed the world, and what came back."""
     if not rect.height:
         return
     surface.fill(PANEL, rect)
@@ -574,22 +657,42 @@ def draw_rail(surface, rect, log, ui):
     pad = round(16 * ui)
     write(surface, "SQL", (rect.left + pad, rect.top + pad),
           size=round(20 * ui), colour=MUTED, bold=True)
+    for name, slot in rail_toggle(rect, ui).items():
+        on = view.log_all if name == "all" else not view.log_all
+        write(surface, name, slot.topleft, size=round(18 * ui),
+              colour=INK if on else FAINT, bold=on)
 
-    line = rect.top + pad + round(30 * ui)
-    for age, statement in enumerate(reversed(log)):
-        size, colour = ((round(22 * ui), INK) if age == 0 else
-                        (round(18 * ui), MUTED) if age < 4 else
-                        (round(15 * ui), FAINT))
-        if age == 0:
-            pygame.draw.rect(surface, ACCENT,
-                             (rect.left, line - 4, round(3 * ui), size + 8))
-        for chunk in wrap(statement, rect.width - 2 * pad, size):
-            if line > rect.bottom - size:
-                return
-            write(surface, chunk, (rect.left + pad, line), size=size,
-                  colour=colour)
+    quiet = db.quiet if db is not None else 0
+    for shown in rail_layout(rect, session.log, ui, quiet, view.log_all):
+        entry, size = shown["entry"], shown["size"]
+        error = getattr(entry, "error", None)
+        line = shown["rect"].top
+
+        if shown["index"] == len(session.log) - 1 or error:
+            # The newest statement gets an accent bar; a refused one gets a red
+            # one. `40001 could not serialize access` is a slide in itself.
+            pygame.draw.rect(surface, ALARM if error else ACCENT,
+                             (rect.left, line - round(4 * ui), round(3 * ui),
+                              shown["rect"].height + round(8 * ui)))
+        for chunk in shown["lines"]:
+            write(surface, chunk, (shown["rect"].left, line), size=size,
+                  colour=ALARM if error else shown["colour"])
             line += size
-        line += round(8 * ui)
+        note = getattr(entry, "outcome", None)
+        if note:
+            write(surface, note, (shown["rect"].left + round(10 * ui), line),
+                  size=round(16 * ui), colour=ALARM if error else FAINT)
+
+    pending = would_send(db, view, world)
+    if pending:
+        write(surface, "would send:", (rect.left + pad,
+                                       rect.bottom - round(40 * ui)),
+              size=round(16 * ui), colour=FAINT)
+        for index, chunk in enumerate(
+                wrap(pending, rect.width - 2 * pad, round(17 * ui))[:1]):
+            write(surface, chunk, (rect.left + pad,
+                                   rect.bottom - round(22 * ui)),
+                  size=round(17 * ui), colour=MUTED)
 
 
 def wrap(statement, width, size):
@@ -1009,7 +1112,7 @@ def draw(surface, world, session, view, legend=None, db=None):
     draw_hud(surface, bands.hud, world["snap"], session, view, bands.ui)
     draw_context(surface, bands.context, world["snap"], view, world, legend,
                  bands.ui)
-    draw_rail(surface, bands.rail, session.log, bands.ui)
+    draw_rail(surface, bands.rail, session, view, world, db, bands.ui)
     draw_prompt(surface, bands.prompt, view, db, bands.ui)
     draw_ghost(surface, world["board"], view, world)
     draw_result(surface, bands, view)
@@ -1314,6 +1417,17 @@ def click_chrome(db, session, view, world, pos):
         if rect.collidepoint(pos):
             return False                   # inside the tray, but on no row
         view.tray = None                   # clicking away closes it
+
+    for name, slot in rail_toggle(bands.rail, bands.ui).items():
+        if slot.collidepoint(pos):
+            view.log_all = name == "all"
+            return True
+    for shown in rail_layout(bands.rail, session.log, bands.ui):
+        if shown["entry"] is not None and shown["rect"].collidepoint(pos):
+            # Back into the prompt, editable. Re-running a statement to watch
+            # its answer change is the point of having the log at all.
+            view.line["text"], view.line["at"] = str(shown["entry"]), None
+            return True
 
     for key, slot in hud_slots(bands.hud, bands.ui).items():
         if not slot.collidepoint(pos):

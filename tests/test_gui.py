@@ -26,6 +26,16 @@ import palette                                      # noqa: E402
 import render                                       # noqa: E402
 
 
+def statements(session):
+    """The log as plain SQL.
+
+    Entries are db.Sent records: the statement, how long it took, how many rows
+    it returned, and the SQLSTATE if PostgreSQL refused it. Most assertions
+    only care about the first of those.
+    """
+    return [entry.sql for entry in session.log]
+
+
 @pytest.fixture(scope="session", autouse=True)
 def pygame_ready():
     pygame.init()
@@ -462,7 +472,7 @@ def test_clicking_your_own_unit_selects_it_and_lights_up_where_it_can_go(rome):
     assert stale is True
     assert view.selected == 2
     assert session.highlight[(8, 6)] == 1              # cost, not just a tile
-    assert session.log[-1] == "SELECT x, y, cost FROM reachable(2)"
+    assert statements(session)[-1] == "SELECT x, y, cost FROM reachable(2)"
 
 
 def test_clicking_a_square_moves_the_selected_unit(rome):
@@ -475,7 +485,7 @@ def test_clicking_a_square_moves_the_selected_unit(rome):
     click_on(db, session, view, world, board, (8, 6))
     assert view.trouble == ""
     assert core.my_unit_at(db, 8, 6, 1) == 2
-    assert "move_unit(2, 8, 6)" in " ".join(session.log)
+    assert "move_unit(2, 8, 6)" in " ".join(statements(session))
     # Still selected, and the reachable set has shrunk with the movement spent.
     assert view.selected == 2
     assert max(session.highlight.values()) == 1
@@ -541,8 +551,8 @@ def test_clicking_an_enemy_attacks_it(rome):
     click_on(db, session, view, world, board, (7, 6))
     click_on(db, session, view, world, board, (8, 6))
     assert view.trouble == ""
-    assert "attack(2, 8, 6)" in " ".join(session.log)
-    assert "move_unit" not in " ".join(session.log)
+    assert "attack(2, 8, 6)" in " ".join(statements(session))
+    assert "move_unit" not in " ".join(statements(session))
     # It was a fight, so their warrior took damage and ours stayed put.
     assert db.one("SELECT hp FROM unit WHERE unit_id = 4")["hp"] < 20
     assert core.my_unit_at(db, 7, 6, 1) == 2
@@ -589,7 +599,7 @@ def test_space_ends_the_turn(rome):
     world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
     gui.handle(event(pygame.KEYDOWN, key=pygame.K_SPACE), db, session, view, world)
     assert core.snapshot(db, session)["world"]["turn"] == 2
-    assert "end_turn()" in " ".join(session.log)
+    assert "end_turn()" in " ".join(statements(session))
 
 
 def test_escape_drops_the_selection_before_it_quits(rome):
@@ -764,7 +774,7 @@ def test_buying_hands_the_unit_to_the_cursor_and_the_map_places_it(rome):
     click_at(db, session, view, world, world["board"].rect_of(8, 8).center)
     assert view.trouble == ""
     assert view.placing is None
-    assert "buy_unit('warrior', 8, 8)" in " ".join(session.log)
+    assert "buy_unit('warrior', 8, 8)" in " ".join(statements(session))
     assert core.my_unit_at(db, 8, 8, 1) is not None
 
 
@@ -827,7 +837,7 @@ def test_the_civ_tray_switches_which_player_this_window_is(rome):
 
     click_at(db, session, view, world, slots["civ:2"].center)
     assert session.civ_id == 2
-    assert session.log[-1] == "SELECT set_config('app.civ_id', '2', false)"
+    assert statements(session)[-1] == "SELECT set_config('app.civ_id', '2', false)"
     assert db.one("SELECT current_civ() AS me")["me"] == 2
 
 
@@ -853,7 +863,7 @@ def test_the_new_game_spinners_step_and_deal(rome):
     view.newgame.update(width=20, height=12, seed=7)
     click_at(db, session, view, world, slots["deal"].center)
     assert view.tray is None
-    assert "new_game(20, 12, 7, 1)" in " ".join(session.log)
+    assert "new_game(20, 12, 7, 1)" in " ".join(statements(session))
     assert core.snapshot(db, session)["world"]["width"] == 20
 
 
@@ -1005,7 +1015,7 @@ def test_typing_sql_runs_it_and_keeps_the_rows(rome):
     assert view.trouble == ""
     assert [row["name"] for row in view.result] == ["Rome", "Carthage"]
     # Typed statements are always logged, unlike the reads behind a redraw.
-    assert session.log[-1] == "SELECT name, gold FROM civ ORDER BY civ_id"
+    assert statements(session)[-1] == "SELECT name, gold FROM civ ORDER BY civ_id"
 
 
 def test_ctrl_enter_forces_sql(rome):
@@ -1197,3 +1207,165 @@ def test_the_prompt_still_works_with_no_world_at_all(dsn):
     assert view.trouble == ""
     world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
     assert world["snap"]["world"]["width"] == 20
+
+
+# ------------------------------------------------------------------ the log
+# The log is the artifact being taught, so what it says about each statement --
+# how long, how many rows, and the SQLSTATE when refused -- is the substance.
+
+def test_each_entry_carries_what_came_back(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    typing(db, session, view, world, "SELECT * FROM unit")
+
+    entry = session.log[-1]
+    # Three, not four: the fixture spent the settler on founding Roma.
+    assert entry.rows == 3
+    assert entry.ms > 0
+    assert entry.error is None
+    assert entry.outcome.startswith("-> 3")
+
+
+def test_a_refused_statement_is_logged_with_its_sqlstate(rome):
+    """`40001 could not serialize access` is a slide in itself, and it only
+    gets to be one if the refusal reaches the log rather than being swallowed.
+    """
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+    click_on(db, session, view, world, world["board"], (7, 7))    # ocean
+
+    refused = next(e for e in session.log if e.error)
+    assert refused.sql == "SELECT move_unit(2, 7, 7) AS cost"
+    assert refused.rows is None
+    assert refused.error.startswith("P0001")          # raise_exception
+    assert "cannot reach" in refused.error
+
+
+def test_the_newest_statement_is_the_largest_and_the_rest_dim(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    for n in range(6):
+        typing(db, session, view, world, f"SELECT {n} AS n")
+
+    shown = gui.rail_layout(world["bands"].rail, session.log, 1.0)
+    sizes = [entry["size"] for entry in shown]
+    assert sizes[0] > sizes[1]                        # newest, then context
+    assert sizes[1] == sizes[2]
+    assert sizes[-1] < sizes[1]
+    # Newest first, and each entry gets its own rectangle for clicking.
+    assert shown[0]["entry"] is session.log[-1]
+    assert all(a["rect"].bottom <= b["rect"].top
+               for a, b in zip(shown, shown[1:]))
+
+
+def test_clicking_an_entry_loads_it_back_into_the_prompt(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    typing(db, session, view, world, "SELECT count(*) AS n FROM city")
+
+    shown = gui.rail_layout(world["bands"].rail, session.log,
+                            world["bands"].ui)
+    click_at(db, session, view, world, shown[0]["rect"].center)
+    assert view.line["text"] == "SELECT count(*) AS n FROM city"
+
+
+def test_the_writes_all_toggle_rolls_up_the_silent_reads(rome):
+    """rows() is silent because a redraw would drown everything else, but the
+    reads are counted, so `all` can still say how many there were."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    assert db.quiet > 0
+
+    writes_only = gui.rail_layout(world["bands"].rail, session.log, 1.0,
+                                  db.quiet, all_reads=False)
+    assert all(entry["entry"] is not None for entry in writes_only)
+
+    toggle = gui.rail_toggle(world["bands"].rail, world["bands"].ui)
+    click_at(db, session, view, world, toggle["all"].center)
+    assert view.log_all is True
+    rolled = gui.rail_layout(world["bands"].rail, session.log, 1.0, db.quiet,
+                             all_reads=True)
+    assert rolled[0]["entry"] is None
+    assert "reads behind redraws" in rolled[0]["lines"][0]
+
+    click_at(db, session, view, world, toggle["writes"].center)
+    assert view.log_all is False
+
+
+# ------------------------------------------------------------- would send:
+# The highest-value single thing in the window: the room reads the statement
+# before it goes out, and then watches that exact text arrive in the log.
+
+def test_the_preview_is_the_statement_that_would_go_out(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+
+    click_on(db, session, view, world, world["board"], (7, 6))
+    view.hover = (8, 6)
+    preview = gui.would_send(db, view, world)
+    assert preview == "SELECT move_unit(2, 8, 6) AS cost"
+
+    # Character for character what the click then logs.
+    click_on(db, session, view, world, world["board"], (8, 6))
+    assert statements(session)[-2] == preview
+
+
+def test_the_preview_says_attack_when_an_enemy_is_under_the_cursor(rome):
+    db, session = rome
+    view = gui.View()
+    db.rows("""UPDATE unit SET tile_id = (SELECT tile_id FROM tile
+                                          WHERE x = 8 AND y = 6)
+               WHERE unit_id = 4""")
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+    view.hover = (8, 6)
+    assert gui.would_send(db, view, world) == "SELECT attack(2, 8, 6) AS outcome"
+
+
+def test_the_preview_says_reachable_over_your_own_unit(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    view.hover = (7, 6)
+    assert gui.would_send(db, view, world) == "SELECT x, y, cost FROM reachable(2)"
+
+
+def test_the_preview_says_buy_while_a_unit_is_being_placed(rome):
+    db, session = rome
+    view = gui.View()
+    view.placing = "warrior"
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    view.hover = (8, 8)
+    assert gui.would_send(db, view, world) == \
+        "SELECT buy_unit('warrior', 8, 8) AS outcome"
+
+
+def test_there_is_nothing_to_preview_with_nothing_selected(rome):
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    view.hover = (12, 12)
+    assert gui.would_send(db, view, world) is None
+    view.hover = None
+    assert gui.would_send(db, view, world) is None
+
+
+def test_the_preview_costs_no_statement(rome):
+    """It is the same choice act_on makes, written out instead of executed."""
+    db, session = rome
+    view = gui.View()
+    world = gui.read_world(db, session, view, gui.DEFAULT_SIZE)
+    click_on(db, session, view, world, world["board"], (7, 6))
+
+    before, logged = db.quiet, len(session.log)
+    for spot in [(8, 6), (9, 6), (7, 6), (8, 8)]:
+        view.hover = spot
+        gui.would_send(db, view, world)
+    assert (db.quiet, len(session.log)) == (before, logged)
