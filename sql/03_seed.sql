@@ -16,11 +16,11 @@ INSERT INTO terrain (code, glyph, colour, food, production, gold, move_cost, pas
 -- client shows without deriving it, so they have to be kept honest by hand.
 INSERT INTO tech (code, name, cost, description) VALUES
   ('agriculture',      'Agriculture',      20,
-   '+1 food from grassland. The root of the tree.'),
+   '+1 food from grassland.'),
   ('mining',           'Mining',           20,
-   '+2 production from hills, the largest single bonus.'),
+   '+2 production from hills.'),
   ('pottery',          'Pottery',          35,
-   '+1 food from ocean, so a coastal city stops starving.'),
+   '+1 food from ocean.'),
   ('animal_husbandry', 'Animal Husbandry', 35,
    '+1 food from plains.'),
   ('bronze_working',   'Bronze Working',   50,
@@ -32,9 +32,9 @@ INSERT INTO tech (code, name, cost, description) VALUES
   ('currency',         'Currency',         90,
    '+1 gold from grassland and from plains.'),
   ('mathematics',      'Mathematics',     120,
-   'No yields, and nothing beyond it. Prestige only.'),
+   'No yields yet.'),
   ('philosophy',       'Philosophy',      120,
-   'No yields, and nothing beyond it. Prestige only.');
+   'No yields yet.');
 
 -- The DAG. currency and mathematics each need two prerequisites, which is what
 -- makes "what can I research?" a genuine division rather than a simple join.
